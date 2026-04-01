@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "forjob: build",
+      "type": "shell",
+      "command": "./scripts/with-node.sh node_modules/typescript/lib/tsc.js -p tsconfig.json",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$tsc",
+      "group": "build"
+    }
+  ]
+}

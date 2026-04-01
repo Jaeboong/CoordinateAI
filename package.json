@@ -1,0 +1,149 @@
+{
+  "name": "forjob",
+  "displayName": "ForJob",
+  "description": "Personal VS Code essay feedback orchestrator for Codex, Claude Code, and Gemini CLI.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:forjob.sidebar",
+    "onCommand:forjob.refresh"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "./scripts/with-node.sh node_modules/typescript/lib/tsc.js -p tsconfig.json",
+    "watch": "./scripts/with-node.sh node_modules/typescript/lib/tsc.js -p tsconfig.json --watch",
+    "postinstall": "./scripts/setup-providers.sh",
+    "setup:providers": "./scripts/setup-providers.sh",
+    "test": "./scripts/with-node.sh node_modules/typescript/lib/tsc.js -p tsconfig.json && ./scripts/with-node.sh --test dist/test/*.test.js",
+    "check": "npm run test"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "forjob.refresh",
+        "title": "ForJob: Refresh"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "forjob",
+          "title": "ForJob",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "forjob": [
+        {
+          "id": "forjob.sidebar",
+          "name": "Essay Orchestrator",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ForJob",
+      "properties": {
+        "forjob.storageRoot": {
+          "type": "string",
+          "default": ".forjob",
+          "description": "Workspace-relative directory used to store ForJob data."
+        },
+        "forjob.providers.codex.command": {
+          "type": "string",
+          "default": "codex",
+          "description": "Command used to invoke the Codex CLI."
+        },
+        "forjob.providers.codex.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Codex model override. Leave empty to use the CLI default."
+        },
+        "forjob.providers.codex.effort": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Codex reasoning effort override. Leave empty to use the CLI default."
+        },
+        "forjob.providers.claude.command": {
+          "type": "string",
+          "default": "claude",
+          "description": "Command used to invoke the Claude Code CLI."
+        },
+        "forjob.providers.claude.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Claude model override. Leave empty to use the CLI default."
+        },
+        "forjob.providers.claude.effort": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Claude effort override. Leave empty to use the CLI default."
+        },
+        "forjob.providers.gemini.command": {
+          "type": "string",
+          "default": "gemini",
+          "description": "Command used to invoke the Gemini CLI."
+        },
+        "forjob.providers.gemini.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Gemini model override. Leave empty to use the CLI default."
+        },
+        "forjob.providers.codex.authMode": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "apiKey"
+          ],
+          "default": "cli",
+          "description": "Authentication mode for Codex."
+        },
+        "forjob.providers.claude.authMode": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "apiKey"
+          ],
+          "default": "cli",
+          "description": "Authentication mode for Claude Code."
+        },
+        "forjob.providers.gemini.authMode": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "apiKey"
+          ],
+          "default": "cli",
+          "description": "Authentication mode for Gemini."
+        }
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "media",
+    "README.md",
+    "node_modules"
+  ],
+  "dependencies": {
+    "fast-xml-parser": "^5.2.5",
+    "jszip": "^3.10.1",
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^5.6.205",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/vscode": "^1.92.0",
+    "pdfkit": "^0.18.0",
+    "typescript": "^5.8.2"
+  }
+}

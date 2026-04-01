@@ -1,0 +1,55 @@
+import * as assert from "node:assert/strict";
+import test from "node:test";
+import { buildSidebarScript } from "../webview/sidebarScript";
+
+test("buildSidebarScript returns parseable browser script", () => {
+  const script = buildSidebarScript();
+
+  assert.doesNotThrow(() => {
+    new Function(script);
+  });
+
+  assert.match(script, /실시간 대화형/);
+  assert.match(script, /심화 피드백/);
+  assert.match(script, /AI 도구/);
+  assert.match(script, /프로필/);
+  assert.match(script, /프로젝트/);
+  assert.match(script, /실행/);
+  assert.match(script, /set-review-mode/);
+  assert.match(script, /set-run-coordinator/);
+  assert.match(script, /set-run-reviewer/);
+  assert.match(script, /리뷰어 추가/);
+  assert.match(script, /run-setup-details/);
+  assert.match(script, /초기화/);
+  assert.match(script, /실행 설정/);
+  assert.match(script, /toggle-project-create/);
+  assert.match(script, /project-inline-panel/);
+  assert.match(script, /projects-toolbar/);
+  assert.match(script, /project-fold-summary/);
+  assert.match(script, /reset-project-rubric/);
+  assert.match(script, /회사 이름/);
+  assert.match(script, /포지션/);
+  assert.match(script, /주요 업무/);
+  assert.match(script, /자격요건/);
+  assert.match(script, /열림/);
+  assert.match(script, /접힘/);
+  assert.match(script, /삭제/);
+  assert.match(script, /project-fold/);
+  assert.match(script, /pin-toggle/);
+  assert.match(script, /pin-icon/);
+  assert.match(script, /reviewer-slot-label/);
+  assert.match(script, /reviewer-remove-button/);
+  assert.match(script, /reviewer-remove-icon/);
+  assert.match(script, /run-document-list/);
+  assert.match(script, /toggle-run-extra-doc/);
+  assert.match(script, /run-document-chip/);
+  assert.match(script, /run-document-toggle-icon/);
+  assert.match(script, /conversation-composer/);
+  assert.match(script, /대화에 메시지를 보내세요/);
+  assert.match(script, /논의 이어가기/);
+  assert.match(script, /continuationDisabledAttr/);
+  assert.match(script, /speaker-name/);
+  assert.match(script, /speakerProviderClass/);
+  assert.match(script, /completed-run-composer-form/);
+  assert.match(script, /continueRunDiscussion/);
+});
