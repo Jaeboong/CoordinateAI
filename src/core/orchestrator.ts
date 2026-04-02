@@ -63,6 +63,19 @@ interface BuiltPrompt {
   discussionLedgerChars: number;
 }
 
+type NotionRequestKind = "explicit" | "implicit" | "auto";
+
+interface NotionRequestDescriptor {
+  text: string;
+  kind: NotionRequestKind;
+}
+
+interface RealtimeReferencePacket {
+  refId: string;
+  sourceLabel: string;
+  summary: string;
+}
+
 export class ReviewOrchestrator {
   constructor(
     private readonly storage: ForJobStorage,
@@ -104,12 +117,12 @@ export class ReviewOrchestrator {
       profile: "full"
     });
     const trimmedContinuationNote = request.continuationNote?.trim() || undefined;
-    const normalizedNotionRequest = normalizeNotionRequest(request.notionRequest);
-    const derivedNotionRequest = normalizeNotionRequest(deriveImplicitNotionRequest(trimmedContinuationNote));
-    const effectiveNotionRequest =
-      normalizedNotionRequest ||
-      derivedNotionRequest ||
-      buildAutoNotionRequest(project.notionPageIds);
+    const notionRequestDescriptor = resolveNotionRequestDescriptor(
+      request.notionRequest,
+      trimmedContinuationNote,
+      project.notionPageIds
+    );
+    const effectiveNotionRequest = notionRequestDescriptor?.text;
     const continuationContext = request.continuationFromRunId
       ? await this.storage.loadRunContinuationContext(request.projectSlug, request.continuationFromRunId)
       : undefined;
@@ -181,7 +194,7 @@ export class ReviewOrchestrator {
           continuationContext,
           trimmedContinuationNote
         );
-        const notionPrompt = buildNotionPrePassPrompt(notionContextMarkdown, effectiveNotionRequest);
+        const notionPrompt = buildNotionPrePassPrompt(notionContextMarkdown, notionRequestDescriptor);
         const notionTurn = await this.executeTurn(
           request.projectSlug,
           runId,
@@ -684,9 +697,10 @@ export class ReviewOrchestrator {
 
           const MIN_ROUNDS_BEFORE_CONSENSUS = 2;
           const reviewerStatuses = collectRealtimeReviewerStatuses(currentRoundReviewerTurns, activeReviewers);
-          const unanimousApproval = hasRealtimeConsensus(activeReviewers, reviewerStatuses);
-          const ledgerReadyForFinalDraft = hasResolvedOpenChallenges(discussionLedger);
-          if (unanimousApproval && round < MIN_ROUNDS_BEFORE_CONSENSUS) {
+          const allReviewersApprove = hasAllApprovingRealtimeReviewers(activeReviewers, reviewerStatuses);
+          const currentSectionReady = isCurrentSectionReady(discussionLedger, activeReviewers, reviewerStatuses);
+          const wholeDocumentReady = isWholeDocumentReady(discussionLedger, activeReviewers, reviewerStatuses);
+          if (allReviewersApprove && round < MIN_ROUNDS_BEFORE_CONSENSUS) {
             // 너무 이른 합의 — devil's advocate 발동
             const challengePrompt = buildDevilsAdvocatePrompt(
               compiledContextMarkdown,
@@ -715,7 +729,7 @@ export class ReviewOrchestrator {
             continue;
           }
 
-          if (unanimousApproval && ledgerReadyForFinalDraft) {
+          if (wholeDocumentReady) {
             const finalContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "full");
             const finalPrompt = buildRealtimeFinalDraftPrompt(
               finalContextMarkdown,
@@ -761,16 +775,21 @@ export class ReviewOrchestrator {
             break;
           }
 
+          if (currentSectionReady && discussionLedger && discussionLedger.deferredChallenges.length > 0) {
+            round += 1;
+            continue;
+          }
+
           if (round % 4 === 0) {
             await eventSink({
               timestamp: nowIso(),
               type: "awaiting-user-input",
               round,
-              message: `Round ${round} ended without unanimous approval. Press Enter to continue, add guidance, or type /done to stop without a final draft.`
+              message: `Round ${round} ended without a document-ready conclusion. Press Enter to continue, add guidance, or type /done to stop without a final draft.`
             });
 
             if (!requestUserIntervention) {
-              throw new Error("Realtime discussion reached the safety limit without unanimous approval.");
+              throw new Error("Realtime discussion reached the safety limit without a document-ready conclusion.");
             }
 
             const intervention = (await requestUserIntervention({
@@ -1055,6 +1074,10 @@ function sumPromptBlockChars(blocks: Array<string | undefined> = []): number {
   return blocks.reduce((sum, block) => sum + (block?.length ?? 0), 0);
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function finalizePromptMetrics(prompt: BuiltPrompt): PromptMetrics {
   return {
     promptKind: prompt.promptKind,
@@ -1254,8 +1277,12 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
+    "## Deferred Challenges",
     "Write Current Focus as one line, Target Section as a short label, and Mini Draft as a 2-4 sentence candidate rewrite for only that target section.",
-    "Accepted Decisions and Open Challenges must use bullet items. If empty, write exactly '- 없음'.",
+    "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
+    "Open Challenges are blockers for the current Target Section only.",
+    "Deferred Challenges are valid follow-up issues for later sections or final polish.",
+    "If Open Challenges are empty but Deferred Challenges remain, hand off Target Section to the next deferred issue instead of reopening the completed section.",
     hasReviewerHistory
       ? "Use the latest reviewer feedback and the previous ledger to move one unresolved issue closer to convergence."
       : "Open the discussion by naming the single highest-leverage issue and proposing the first Mini Draft.",
@@ -1311,8 +1338,12 @@ function buildRealtimeCoordinatorRedirectPrompt(
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
+    "## Deferred Challenges",
     "Acknowledge the new user message by reflecting it inside Current Focus and Mini Draft.",
-    "Accepted Decisions and Open Challenges must use bullet items. If empty, write exactly '- 없음'.",
+    "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
+    "Open Challenges are blockers for the current Target Section only.",
+    "Deferred Challenges are valid follow-up issues for later sections or final polish.",
+    "If Open Challenges are empty but Deferred Challenges remain, hand off Target Section to the next deferred issue instead of reopening the completed section.",
     "Do not write the full essay yet.",
     "",
     contextMarkdown,
@@ -1351,22 +1382,21 @@ function buildRealtimeReviewerPrompt(
     return true;
   });
   const historyBlock = buildRealtimeDiscussionHistory(
-    visibleTurns.filter((turn) => turn.role !== "coordinator" || turn.round < round),
+    visibleTurns.filter((turn) => turn.role === "coordinator" && turn.round < round),
     { maxTurns: 2, maxCharsPerTurn: 220 }
   );
-  const previousRoundBlock = buildPreviousRoundReviewerSummary(visibleTurns, round);
+  const coordinatorReferenceBlock = buildCoordinatorReferenceBlock(visibleTurns, round, ledger);
+  const reviewerReferenceBlock = buildReviewerReferencesBlock(visibleTurns, round, currentParticipantId);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger);
   const perspectiveInstruction = getPerspectiveInstruction(perspective);
-  const crossFeedbackInstruction = round > 1
-    ? 'Line 3 starts with "Cross-feedback:" and explicitly agree or disagree with exactly one objection from the previous-round reviewer summary.'
-    : 'Line 3 starts with "Cross-feedback:" and state that there is no previous-round objection to react to yet.';
+  const crossFeedbackInstruction = 'Line 3 starts with "Cross-feedback:" and explicitly respond to exactly one reference using either "Cross-feedback: [refId] agree ..." or "Cross-feedback: [refId] disagree ...".';
 
   return buildPrompt({
     promptKind: "realtime-reviewer",
     contextProfile: "minimal",
     contextMarkdown,
     notionBrief,
-    historyBlocks: [previousRoundBlock, historyBlock],
+    historyBlocks: [coordinatorReferenceBlock, reviewerReferenceBlock, historyBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
     "You are a reviewer in a realtime multi-model essay discussion.",
@@ -1383,7 +1413,9 @@ function buildRealtimeReviewerPrompt(
     "Status: APPROVE",
     "Status: REVISE",
     "Status: BLOCK",
-    "Use APPROVE only if the Mini Draft direction is ready for a final rewrite and no Open Challenge should remain open.",
+    "Use APPROVE if the current direction is section-ready.",
+    "Use REVISE if improvement is recommended but it should not block closing the current Target Section.",
+    "Use BLOCK only if the current Target Section should not close yet.",
     "Do not use headings or bullet lists.",
     "",
     contextMarkdown,
@@ -1392,7 +1424,9 @@ function buildRealtimeReviewerPrompt(
     notionBrief ? "" : "",
     ledgerBlock,
     "",
-    previousRoundBlock,
+    coordinatorReferenceBlock,
+    "",
+    reviewerReferenceBlock,
     "",
     guidanceBlock,
     guidanceBlock ? "" : "",
@@ -1422,7 +1456,7 @@ function buildRealtimeFinalDraftPrompt(
     sections: [
     "You are the coordinator closing a realtime multi-model essay review session.",
     buildFinalEssayKoreanInstruction(),
-    "Every active reviewer has approved the current direction and the remaining Open Challenges are resolved.",
+    "The current section is ready, no blocking reviewer feedback remains, and there are no Deferred Challenges left.",
     "Write the final polished essay draft now.",
     "Use the Mini Draft as the local seed, preserve the Accepted Decisions, and keep the final essay aligned with the resolved focus.",
     "Return only the rewritten essay in Markdown.",
@@ -1472,7 +1506,10 @@ function buildDevilsAdvocatePrompt(
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
+    "## Deferred Challenges",
     "Use this turn to challenge one assumption the reviewers accepted too quickly and add at least one concrete Open Challenge.",
+    "Deferred Challenges should capture later follow-up issues instead of blocking the current section.",
+    "If the current section is already closed, redirect the next Target Section to one Deferred Challenge instead of reopening the same section.",
     "Do not write the full essay.",
     "",
     contextMarkdown,
@@ -1490,7 +1527,11 @@ function buildDevilsAdvocatePrompt(
   });
 }
 
-function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string): BuiltPrompt {
+function buildNotionPrePassPrompt(
+  contextMarkdown: string,
+  notionRequest: NotionRequestDescriptor | undefined
+): BuiltPrompt {
+  const requestHeading = notionRequest?.kind === "auto" ? "## Auto Context Request" : "## User Notion Request";
   return buildPrompt({
     promptKind: "notion-prepass",
     contextProfile: "minimal",
@@ -1514,8 +1555,8 @@ function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string
     "",
     contextMarkdown,
     "",
-    "## User Notion Request",
-    notionRequest
+    requestHeading,
+    notionRequest?.text ?? ""
     ]
   });
 }
@@ -1568,7 +1609,10 @@ function buildDiscussionLedgerBlock(ledger?: DiscussionLedger, heading = "## Dis
     ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
     "",
     "### Open Challenges",
-    ...formatDiscussionLedgerItems(ledger.openChallenges)
+    ...formatDiscussionLedgerItems(ledger.openChallenges),
+    "",
+    "### Deferred Challenges",
+    ...formatDiscussionLedgerItems(ledger.deferredChallenges)
   ].join("\n");
 }
 
@@ -1589,7 +1633,10 @@ function buildDiscussionLedgerArtifact(ledger: DiscussionLedger): string {
     ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
     "",
     "## Open Challenges",
-    ...formatDiscussionLedgerItems(ledger.openChallenges)
+    ...formatDiscussionLedgerItems(ledger.openChallenges),
+    "",
+    "## Deferred Challenges",
+    ...formatDiscussionLedgerItems(ledger.deferredChallenges)
   ].join("\n");
 }
 
@@ -1610,6 +1657,7 @@ function extractDiscussionLedger(output: string, round: number): DiscussionLedge
     miniDraft,
     acceptedDecisions: parseDiscussionLedgerItems(extractMarkdownSection(output, "Accepted Decisions")),
     openChallenges: parseDiscussionLedgerItems(extractMarkdownSection(output, "Open Challenges")),
+    deferredChallenges: parseDiscussionLedgerItems(extractMarkdownSection(output, "Deferred Challenges")),
     targetSection,
     updatedAtRound: round
   };
@@ -1747,6 +1795,29 @@ function normalizeNotionRequest(request?: string): string | undefined {
   return /[\p{L}\p{N}]/u.test(trimmed) ? trimmed : undefined;
 }
 
+function resolveNotionRequestDescriptor(
+  explicitRequest?: string,
+  continuationNote?: string,
+  pageIds?: string[]
+): NotionRequestDescriptor | undefined {
+  const normalizedExplicit = normalizeNotionRequest(explicitRequest);
+  if (normalizedExplicit) {
+    return { text: normalizedExplicit, kind: "explicit" };
+  }
+
+  const implicitRequest = normalizeNotionRequest(deriveImplicitNotionRequest(continuationNote));
+  if (implicitRequest) {
+    return { text: implicitRequest, kind: "implicit" };
+  }
+
+  const autoRequest = buildAutoNotionRequest(pageIds);
+  if (autoRequest) {
+    return { text: autoRequest, kind: "auto" };
+  }
+
+  return undefined;
+}
+
 function compressNotionBrief(brief: string, profile: CompileContextProfile): string {
   const trimmed = brief.trim();
   if (!trimmed) {
@@ -1833,10 +1904,107 @@ function buildPreviousRoundReviewerSummary(turns: ReviewTurn[], round: number): 
     "## Previous Round Reviewer Summary",
     ...previousRoundTurns.map((turn) => {
       const status = extractRealtimeReviewerStatus(turn.response);
-      const objection = extractReviewerObjection(turn.response);
+      const objection = extractRealtimeReviewerObjection(turn.response);
       return `- ${turnLabel(turn)}: ${truncateContinuationText(objection, 180)} (Status: ${status})`;
     })
   ].join("\n");
+}
+
+function buildCoordinatorReferenceBlock(
+  turns: ReviewTurn[],
+  round: number,
+  currentLedger?: DiscussionLedger
+): string {
+  const previousCoordinatorTurn = [...turns]
+    .reverse()
+    .find((turn) => turn.status === "completed" && turn.role === "coordinator" && turn.round > 0 && turn.round < round);
+  const previousLedger = previousCoordinatorTurn
+    ? extractDiscussionLedger(previousCoordinatorTurn.response, previousCoordinatorTurn.round)
+    : undefined;
+  const referenceLedger = previousLedger ?? currentLedger;
+  if (!referenceLedger) {
+    return "## Coordinator Reference\n\n_No coordinator reference yet._";
+  }
+
+  const coordinatorReference: RealtimeReferencePacket = {
+    refId: `coord-r${referenceLedger.updatedAtRound}`,
+    sourceLabel: `Coordinator round ${referenceLedger.updatedAtRound}`,
+    summary: buildCoordinatorReferenceSummary(referenceLedger)
+  };
+  return buildRealtimeReferenceBlock("## Coordinator Reference", [coordinatorReference], "_No coordinator reference yet._");
+}
+
+function buildCoordinatorReferenceSummary(ledger: DiscussionLedger): string {
+  const summaryParts = [
+    `Target Section: ${ledger.targetSection}`,
+    `Current Focus: ${ledger.currentFocus}`
+  ];
+  if (ledger.openChallenges.length > 0) {
+    summaryParts.push(`Open Challenges: ${ledger.openChallenges.join("; ")}`);
+  }
+  if (ledger.deferredChallenges.length > 0) {
+    summaryParts.push(`Deferred Challenges: ${ledger.deferredChallenges.join("; ")}`);
+  }
+  return summaryParts.join(" | ");
+}
+
+function buildReviewerReferencesBlock(
+  turns: ReviewTurn[],
+  round: number,
+  currentParticipantId: string
+): string {
+  const previousRoundTurns = turns.filter(
+    (turn) =>
+      turn.status === "completed" &&
+      turn.role === "reviewer" &&
+      turn.round === round - 1 &&
+      turn.participantId !== currentParticipantId
+  );
+  const references = previousRoundTurns.map((turn) => ({
+    refId: `rev-r${turn.round}-${turn.participantId ?? "reviewer"}`,
+    sourceLabel: `${turnLabel(turn)} round ${turn.round}`,
+    summary: extractRealtimeReviewerObjection(turn.response)
+  }));
+  return buildRealtimeReferenceBlock(
+    "## Reviewer References",
+    references,
+    "_No previous-round reviewer references available._"
+  );
+}
+
+function buildRealtimeReferenceBlock(heading: string, references: RealtimeReferencePacket[], emptyState: string): string {
+  if (references.length === 0) {
+    return `${heading}\n\n${emptyState}`;
+  }
+
+  return [
+    heading,
+    ...references.map((reference) => `- [${reference.refId}] ${reference.sourceLabel}: ${truncateContinuationText(reference.summary, 180)}`)
+  ].join("\n");
+}
+
+function extractRealtimeReviewerObjection(response: string): string {
+  const challenge = extractRealtimeLabeledLine(response, "Challenge");
+  if (challenge) {
+    return challenge;
+  }
+
+  const crossFeedback = extractRealtimeLabeledLine(response, "Cross-feedback");
+  if (crossFeedback) {
+    return crossFeedback;
+  }
+
+  return extractReviewerObjection(response);
+}
+
+function extractRealtimeLabeledLine(response: string, label: string): string {
+  const pattern = new RegExp(`^\\s*${escapeRegExp(label)}\\s*:\\s*(.+)$`, "gim");
+  const matches = [...response.matchAll(pattern)];
+  if (matches.length === 0) {
+    return "";
+  }
+
+  return matches[matches.length - 1][1].trim();
 }
 
 function extractReviewerObjection(response: string): string {
@@ -1851,7 +2019,7 @@ function extractReviewerObjection(response: string): string {
       .split(/\r?\n/)
       .map((item) => item.trim())
       .map((item) => item.replace(/^[-*]\s+/, "").trim())
-      .find((item) => item.length > 0 && !/^status:/i.test(item));
+      .find((item) => item.length > 0 && !/^(status|mini draft|challenge|cross-feedback):/i.test(item));
     if (line) {
       return line;
     }
@@ -1888,15 +2056,34 @@ function collectRealtimeReviewerStatuses(
   return statuses;
 }
 
-function hasRealtimeConsensus(
+function hasAllApprovingRealtimeReviewers(
   activeReviewers: ReviewParticipant[],
   statuses: Map<string, RealtimeReviewerStatus>
 ): boolean {
   return activeReviewers.length > 0 && activeReviewers.every((reviewer) => statuses.get(reviewer.participantId) === "APPROVE");
 }
 
-function hasResolvedOpenChallenges(ledger?: DiscussionLedger): boolean {
-  return ledger !== undefined && ledger.openChallenges.length === 0;
+function hasBlockingRealtimeReviewer(
+  activeReviewers: ReviewParticipant[],
+  statuses: Map<string, RealtimeReviewerStatus>
+): boolean {
+  return activeReviewers.some((reviewer) => statuses.get(reviewer.participantId) === "BLOCK");
+}
+
+function isCurrentSectionReady(
+  ledger: DiscussionLedger | undefined,
+  activeReviewers: ReviewParticipant[],
+  statuses: Map<string, RealtimeReviewerStatus>
+): boolean {
+  return ledger !== undefined && ledger.openChallenges.length === 0 && !hasBlockingRealtimeReviewer(activeReviewers, statuses);
+}
+
+function isWholeDocumentReady(
+  ledger: DiscussionLedger | undefined,
+  activeReviewers: ReviewParticipant[],
+  statuses: Map<string, RealtimeReviewerStatus>
+): boolean {
+  return isCurrentSectionReady(ledger, activeReviewers, statuses) && ledger !== undefined && ledger.deferredChallenges.length === 0;
 }
 
 function appendContinuationContext(

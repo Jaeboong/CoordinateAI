@@ -90,6 +90,7 @@ test("extension message schema accepts discussion ledger events and artifact fla
         miniDraft: "결제 안정화 경험을 문장 앞에 배치합니다.",
         acceptedDecisions: ["성과 수치를 앞단에 둔다"],
         openChallenges: ["회사 적합도 근거가 아직 약하다"],
+        deferredChallenges: ["마지막 포부 문단을 더 구체화한다"],
         targetSection: "지원 동기 1문단",
         updatedAtRound: 2
       }
@@ -138,6 +139,7 @@ test("extension message schema accepts discussion ledger events and artifact fla
                 improvementPlan: false,
                 revisedDraft: true,
                 discussionLedger: true,
+                promptMetrics: false,
                 notionBrief: false,
                 chatMessages: false,
                 events: true

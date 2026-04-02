@@ -124,6 +124,7 @@ export interface DiscussionLedger {
   miniDraft: string;
   acceptedDecisions: string[];
   openChallenges: string[];
+  deferredChallenges: string[];
   targetSection: string;
   updatedAtRound: number;
 }

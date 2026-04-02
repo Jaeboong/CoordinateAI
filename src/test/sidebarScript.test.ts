@@ -60,6 +60,7 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /현재 초점/);
   assert.match(script, /미니 초안/);
   assert.match(script, /남은 쟁점/);
+  assert.match(script, /후속 과제/);
   assert.match(script, /토론 상태 열기/);
   assert.match(script, /discussion-ledger\.md/);
   assert.match(script, /speaker-name/);

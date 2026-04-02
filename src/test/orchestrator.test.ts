@@ -104,6 +104,7 @@ function buildRealtimeLedgerResponse(options: {
   miniDraft: string;
   acceptedDecisions?: string[];
   openChallenges?: string[];
+  deferredChallenges?: string[];
 }): string {
   return [
     "## Current Focus",
@@ -119,7 +120,10 @@ function buildRealtimeLedgerResponse(options: {
     ...(options.acceptedDecisions && options.acceptedDecisions.length > 0 ? options.acceptedDecisions.map((item) => `- ${item}`) : ["- 없음"]),
     "",
     "## Open Challenges",
-    ...(options.openChallenges && options.openChallenges.length > 0 ? options.openChallenges.map((item) => `- ${item}`) : ["- 없음"])
+    ...(options.openChallenges && options.openChallenges.length > 0 ? options.openChallenges.map((item) => `- ${item}`) : ["- 없음"]),
+    "",
+    "## Deferred Challenges",
+    ...(options.deferredChallenges && options.deferredChallenges.length > 0 ? options.deferredChallenges.map((item) => `- ${item}`) : ["- 없음"])
   ].join("\n");
 }
 
@@ -747,7 +751,7 @@ test("orchestrator injects non-empty user intervention into the next cycle promp
   assert.match(chatArtifact, /"speaker": "You"/);
 });
 
-test("realtime mode waits for unanimous approval and saves only the final draft artifact", async (t) => {
+test("realtime mode waits for a document-ready state and saves only the final draft artifact", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));
 
@@ -870,7 +874,7 @@ test("realtime prompts explicitly require Korean responses while preserving stat
   assert.match(finalPrompt.prompt, /Write the final essay draft in Korean \(한국어\)/);
 });
 
-test("realtime reviewer prompts include the latest ledger and previous-round cross-feedback instructions", async (t) => {
+test("realtime reviewer prompts include the latest ledger and scoped cross-feedback references", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));
 
@@ -922,11 +926,319 @@ test("realtime reviewer prompts include the latest ledger and previous-round cro
   const roundTwoReviewerPrompt = gateway.calls.find((call) => call.providerId === "codex" && call.round === 2);
   assert.ok(roundTwoReviewerPrompt);
   assert.match(roundTwoReviewerPrompt.prompt, /## Discussion Ledger/);
-  assert.match(roundTwoReviewerPrompt.prompt, /## Previous Round Reviewer Summary/);
+  assert.match(roundTwoReviewerPrompt.prompt, /## Coordinator Reference/);
+  assert.match(roundTwoReviewerPrompt.prompt, /## Reviewer References/);
   assert.match(roundTwoReviewerPrompt.prompt, /## Mini Draft/);
   assert.match(roundTwoReviewerPrompt.prompt, /성과를 문단 첫머리에 둔다/);
   assert.match(roundTwoReviewerPrompt.prompt, /무신사와의 연결 근거가 아직 약하다/);
-  assert.match(roundTwoReviewerPrompt.prompt, /explicitly agree or disagree with exactly one objection/i);
+  assert.match(roundTwoReviewerPrompt.prompt, /Cross-feedback: \[refId\] agree/);
+  assert.match(roundTwoReviewerPrompt.prompt, /Cross-feedback: \[refId\] disagree/);
+});
+
+test("realtime reviewer prompt uses reference packets and excludes self references by participant id", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Shinhan Bank");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "coordinator") {
+      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+        return "최종본";
+      }
+      return buildRealtimeLedgerResponse({
+        currentFocus: round === 1 ? "직무 지원 이유를 먼저 닫습니다." : "마지막 포부 문단으로 넘어갑니다.",
+        targetSection: round === 1 ? "직무 지원 이유" : "입행 후 포부",
+        miniDraft: round === 1
+          ? "정합성과 운영 안정성을 함께 다루는 이유를 직무 언어로 정리합니다."
+          : "입행 후에는 거래 처리 안정성과 운영 품질 향상에 기여하고 싶습니다.",
+        acceptedDecisions: ["MOA와 CAMPUNG을 함께 쓴다"],
+        openChallenges: [],
+        deferredChallenges: round === 1 ? ["입행 후 포부를 더 구체화한다"] : []
+      });
+    }
+
+    if (round === 1 && options?.participantId === "reviewer-1") {
+      return [
+        "Mini Draft: 직무 언어는 적절합니다.",
+        "Challenge: 남은 쟁점은 이제 닫아도 됩니다.",
+        "Cross-feedback: 첫 라운드라 coordinator note만 참고합니다.",
+        "Status: APPROVE"
+      ].join("\n");
+    }
+
+    if (round === 1 && options?.participantId === "reviewer-2") {
+      return [
+        "Mini Draft: 결론 문장은 더 또렷하게 유지하세요.",
+        "Challenge: 입행 후 포부는 후속 과제로 넘겨도 됩니다.",
+        "Cross-feedback: 첫 라운드라 coordinator note만 참고합니다.",
+        "Status: APPROVE"
+      ].join("\n");
+    }
+
+    return [
+      `Mini Draft: ${options?.participantId} 기준으로 포부 문단 방향은 괜찮습니다.`,
+      "Challenge: 남은 쟁점은 없습니다.",
+      "Cross-feedback: [rev-r1-reviewer-2] agree reviewer 2가 말한 후속 포부 과제 분리에 동의합니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "왜 신한은행인가?",
+    draft: "초안",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "codex"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const reviewerOneRoundTwoPrompt = gateway.calls.find((call) => call.participantId === "reviewer-1" && call.round === 2);
+  assert.ok(reviewerOneRoundTwoPrompt);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /## Coordinator Reference/);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /## Reviewer References/);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /coord-r1/);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /rev-r1-reviewer-2/);
+  assert.doesNotMatch(reviewerOneRoundTwoPrompt.prompt, /rev-r1-reviewer-1/);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /Cross-feedback: \[refId\] agree/);
+  assert.match(reviewerOneRoundTwoPrompt.prompt, /Cross-feedback: \[refId\] disagree/);
+});
+
+test("realtime reviewer references prioritize Challenge lines over Mini Draft lines", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Toss");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "coordinator") {
+      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+        return "최종본";
+      }
+      return buildRealtimeLedgerResponse({
+        currentFocus: round === 1 ? "지원 이유를 닫습니다." : "포부를 닫습니다.",
+        targetSection: round === 1 ? "지원 이유" : "포부",
+        miniDraft: "정합성과 운영 경험을 연결합니다.",
+        acceptedDecisions: ["정합성 문장을 유지한다"],
+        openChallenges: [],
+        deferredChallenges: round === 1 ? ["포부를 더 구체화한다"] : []
+      });
+    }
+
+    if (round === 1 && options?.participantId === "reviewer-1") {
+      return [
+        "Mini Draft: 이 문장은 유지하세요.",
+        "Challenge: 마지막 포부를 더 구체화해야 합니다.",
+        "Cross-feedback: 첫 라운드라 coordinator reference만 있습니다.",
+        "Status: APPROVE"
+      ].join("\n");
+    }
+
+    return [
+      "Mini Draft: 포부는 한 문장 더 구체화하세요.",
+      "Challenge: 남은 쟁점은 없습니다.",
+      "Cross-feedback: [rev-r1-reviewer-1] agree 포부 구체화 과제가 남는다는 점에 동의합니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "왜 토스인가?",
+    draft: "초안",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "gemini"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const roundTwoReviewerPrompt = gateway.calls.find((call) => call.participantId === "reviewer-2" && call.round === 2);
+  assert.ok(roundTwoReviewerPrompt);
+  assert.match(roundTwoReviewerPrompt.prompt, /포부를 더 구체화해야 합니다/);
+  assert.doesNotMatch(roundTwoReviewerPrompt.prompt, /이 문장은 유지하세요\./);
+});
+
+test("realtime closes a section on REVISE when blockers are cleared and hands off deferred challenges", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Kurly");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "coordinator") {
+      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+        return "최종 지원서";
+      }
+      if (round === 1) {
+        return buildRealtimeLedgerResponse({
+          currentFocus: "직무 지원 이유를 닫습니다.",
+          targetSection: "직무 지원 이유",
+          miniDraft: "정합성과 운영 안정성을 뱅킹 직무 언어로 정리합니다.",
+          acceptedDecisions: ["직무 언어로 닫는다"],
+          openChallenges: [],
+          deferredChallenges: ["마지막 포부 문단을 더 구체화한다"]
+        });
+      }
+      return buildRealtimeLedgerResponse({
+        currentFocus: "포부 문단으로 handoff합니다.",
+        targetSection: "마지막 포부 문단",
+        miniDraft: "입행 후에는 거래 처리 안정성과 운영 품질을 높이는 역할을 맡고 싶습니다.",
+        acceptedDecisions: ["직무 지원 이유는 닫혔다"],
+        openChallenges: [],
+        deferredChallenges: []
+      });
+    }
+
+    if (round === 1) {
+      return [
+        "Mini Draft: 지원 이유 문단은 이 방향이면 충분합니다.",
+        "Challenge: 현재 섹션 쟁점은 닫아도 됩니다.",
+        "Cross-feedback: 첫 라운드라 coordinator reference만 있습니다.",
+        options?.participantId === "reviewer-1" ? "Status: REVISE" : "Status: APPROVE"
+      ].join("\n");
+    }
+
+    return [
+      "Mini Draft: 포부 문단도 충분합니다.",
+      "Challenge: 남은 쟁점은 없습니다.",
+      "Cross-feedback: [coord-r1] agree 직무 지원 이유는 이미 section-ready라고 봅니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  const result = await orchestrator.run({
+    projectSlug: project.slug,
+    question: "왜 컬리인가?",
+    draft: "초안",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "gemini"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  assert.equal(result.artifacts.revisedDraft, "최종 지원서");
+  const roundTwoCoordinatorPrompt = gateway.calls.find(
+    (call) => call.providerId === "claude" && call.round === 2 && !/closing a realtime multi-model essay review session/i.test(call.prompt)
+  );
+  assert.ok(roundTwoCoordinatorPrompt);
+  assert.match(roundTwoCoordinatorPrompt.prompt, /## Previous Discussion Ledger/);
+  assert.match(roundTwoCoordinatorPrompt.prompt, /### Deferred Challenges/);
+  assert.match(roundTwoCoordinatorPrompt.prompt, /마지막 포부 문단을 더 구체화한다/);
+  assert.equal(
+    gateway.calls.filter((call) => call.providerId === "claude" && /closing a realtime multi-model essay review session/i.test(call.prompt)).length,
+    1
+  );
+});
+
+test("realtime BLOCK still prevents section closure even when open challenges are empty", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Socar");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "coordinator") {
+      return /closing a realtime multi-model essay review session/i.test(prompt)
+        ? "최종본"
+        : buildRealtimeLedgerResponse({
+            currentFocus: "도입 문단을 닫습니다.",
+            targetSection: "도입 문단",
+            miniDraft: "핵심 임팩트를 먼저 말합니다.",
+            acceptedDecisions: ["임팩트를 먼저 둔다"],
+            openChallenges: [],
+            deferredChallenges: []
+          });
+    }
+
+    return [
+      "Mini Draft: 방향은 나쁘지 않습니다.",
+      "Challenge: 현재 섹션 쟁점은 없지만 아직 문단을 닫으면 안 됩니다.",
+      "Cross-feedback: 첫 라운드라 coordinator reference만 있습니다.",
+      options?.participantId === "reviewer-1" ? "Status: BLOCK" : "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  const result = await orchestrator.run(
+    {
+      projectSlug: project.slug,
+      question: "왜 쏘카인가?",
+      draft: "초안",
+      reviewMode: "realtime",
+      coordinatorProvider: "claude",
+      reviewerProviders: ["codex", "gemini"],
+      rounds: 1,
+      selectedDocumentIds: []
+    },
+    undefined,
+    async () => "/done"
+  );
+
+  assert.equal(result.artifacts.revisedDraft, "초안");
+  assert.equal(
+    gateway.calls.filter((call) => call.providerId === "claude" && /closing a realtime multi-model essay review session/i.test(call.prompt)).length,
+    0
+  );
+});
+
+test("auto notion requests are labeled as auto context requests", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Shinhan Bank");
+  await storage.updateProject({
+    ...(await storage.getProject(project.slug)),
+    notionPageIds: ["page-1", "page-2"]
+  });
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, _prompt, round) => {
+    if (providerId === "claude" && round === 0) {
+      return [
+        "## Resolution",
+        "자동 컨텍스트 확인",
+        "## Notion Brief",
+        "자동 생성된 노션 컨텍스트입니다.",
+        "## Sources Considered",
+        "- page-1"
+      ].join("\n");
+    }
+
+    if (providerId === "claude") {
+      return ["## Summary", "요약", "## Improvement Plan", "- 보강", "## Revised Draft", "수정본"].join("\n");
+    }
+
+    return ["## Overall Verdict", "유용", "## Strengths", "- 좋음", "## Problems", "- 근거 부족", "## Suggestions", "- 보강", "## Direct Responses To Other Reviewers", "- 동의"].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "왜 신한은행인가?",
+    draft: "초안",
+    reviewMode: "deepFeedback",
+    notionRequest: ".",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const notionCall = gateway.calls.find((call) => call.providerId === "claude" && call.round === 0);
+  assert.ok(notionCall);
+  assert.match(notionCall.prompt, /## Auto Context Request/);
+  assert.doesNotMatch(notionCall.prompt, /## User Notion Request/);
 });
 
 test("realtime mode tracks duplicate reviewer slots separately", async (t) => {
@@ -1043,7 +1355,7 @@ test("realtime mode pauses after four rounds without consensus and can stop with
   const ledgerArtifact = await storage.readOptionalRunArtifact(project.slug, result.run.id, "discussion-ledger.md");
   assert.ok(ledgerArtifact);
   assert.match(ledgerArtifact, /## Open Challenges/);
-  assert.ok(events.some((event) => event.type === "awaiting-user-input" && /without unanimous approval/i.test(event.message ?? "")));
+  assert.ok(events.some((event) => event.type === "awaiting-user-input" && /without a document-ready conclusion/i.test(event.message ?? "")));
   assert.ok(events.some((event) => event.type === "user-input-received" && /without a final draft/i.test(event.message ?? "")));
   assert.equal(
     gateway.calls.filter((call) => call.providerId === "claude" && /closing a realtime multi-model essay review session/i.test(call.prompt)).length,

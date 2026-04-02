@@ -44,6 +44,7 @@ export const DiscussionLedgerSchema = z.object({
   miniDraft: z.string(),
   acceptedDecisions: z.array(z.string()),
   openChallenges: z.array(z.string()),
+  deferredChallenges: z.array(z.string()),
   targetSection: z.string(),
   updatedAtRound: z.number().int().min(0)
 });

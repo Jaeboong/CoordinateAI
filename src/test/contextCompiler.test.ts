@@ -64,7 +64,7 @@ test("context compiler applies full, compact, and minimal prompt profiles", asyn
     selectedDocumentIds: [profileDocument.id],
     question: "Why Kurly?",
     draft
-  } as const;
+  };
 
   const full = await compiler.compile({
     ...baseRequest,

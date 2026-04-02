@@ -1153,6 +1153,7 @@ const renderSource = String.raw`
         }
 
         const challenges = Array.isArray(liveDiscussionLedger.openChallenges) ? liveDiscussionLedger.openChallenges : [];
+        const deferredChallenges = Array.isArray(liveDiscussionLedger.deferredChallenges) ? liveDiscussionLedger.deferredChallenges : [];
         el.hidden = false;
         el.innerHTML = \`
           <div class="discussion-ledger-summary">
@@ -1175,6 +1176,12 @@ const renderSource = String.raw`
               \${challenges.length > 0
                 ? \`<ul class="discussion-ledger-list">\${challenges.map((item) => \`<li>\${escapeHtml(item)}</li>\`).join("")}</ul>\`
                 : '<div class="muted small">남은 쟁점이 없습니다.</div>'}
+            </section>
+            <section class="discussion-ledger-block">
+              <div class="discussion-ledger-label">후속 과제</div>
+              \${deferredChallenges.length > 0
+                ? \`<ul class="discussion-ledger-list">\${deferredChallenges.map((item) => \`<li>\${escapeHtml(item)}</li>\`).join("")}</ul>\`
+                : '<div class="muted small">후속 과제가 없습니다.</div>'}
             </section>
           </div>
         \`;
