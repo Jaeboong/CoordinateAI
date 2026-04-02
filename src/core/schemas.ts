@@ -1,10 +1,20 @@
 import { z } from "zod";
-import { authModes, extractionStatuses, providerAuthStatuses, providerIds, reviewModes, runStatuses, sourceTypes } from "./types";
+import {
+  authModes,
+  compileContextProfiles,
+  extractionStatuses,
+  providerAuthStatuses,
+  providerIds,
+  reviewModes,
+  runStatuses,
+  sourceTypes
+} from "./types";
 
 const reviewRoles = ["reviewer", "coordinator"] as const;
 const runEventTypes = [
   "run-started",
   "compiled-context",
+  "prompt-metrics",
   "turn-started",
   "provider-stdout",
   "provider-stderr",
@@ -28,6 +38,7 @@ export const SourceTypeSchema = z.enum(sourceTypes);
 export const ExtractionStatusSchema = z.enum(extractionStatuses);
 export const RunStatusSchema = z.enum(runStatuses);
 export const ReviewModeSchema = z.enum(reviewModes);
+export const CompileContextProfileSchema = z.enum(compileContextProfiles);
 export const DiscussionLedgerSchema = z.object({
   currentFocus: z.string(),
   miniDraft: z.string(),
@@ -35,6 +46,16 @@ export const DiscussionLedgerSchema = z.object({
   openChallenges: z.array(z.string()),
   targetSection: z.string(),
   updatedAtRound: z.number().int().min(0)
+});
+export const PromptMetricsSchema = z.object({
+  promptKind: z.string(),
+  contextProfile: CompileContextProfileSchema,
+  promptChars: z.number().int().min(0),
+  estimatedPromptTokens: z.number().int().min(0),
+  contextChars: z.number().int().min(0),
+  historyChars: z.number().int().min(0),
+  notionBriefChars: z.number().int().min(0),
+  discussionLedgerChars: z.number().int().min(0)
 });
 
 export const ProviderStatusSchema = z.object({
@@ -95,6 +116,8 @@ export const ProjectRecordSchema = z.object({
   qualifications: z.string().optional(),
   rubric: z.string(),
   pinnedDocumentIds: z.array(z.string()),
+  charLimit: z.number().int().min(1).optional(),
+  notionPageIds: z.array(z.string()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -130,6 +153,7 @@ export const ReviewTurnSchema = z.object({
   role: z.enum(reviewRoles),
   round: z.number().int().min(0),
   prompt: z.string(),
+  promptMetrics: PromptMetricsSchema.optional(),
   response: z.string(),
   startedAt: z.string(),
   finishedAt: z.string().optional(),
@@ -163,5 +187,6 @@ export const RunEventSchema = z.object({
   speakerRole: z.enum(runChatSpeakerRoles).optional(),
   recipient: z.string().optional(),
   message: z.string().optional(),
-  discussionLedger: DiscussionLedgerSchema.optional()
+  discussionLedger: DiscussionLedgerSchema.optional(),
+  promptMetrics: PromptMetricsSchema.optional()
 });

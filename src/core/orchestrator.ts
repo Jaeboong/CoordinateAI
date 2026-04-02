@@ -1,8 +1,10 @@
 import { ContextCompiler } from "./contextCompiler";
 import { ForJobStorage, RunContinuationContext } from "./storage";
 import {
+  CompileContextProfile,
   DiscussionLedger,
   ProviderId,
+  PromptMetrics,
   RunChatMessage,
   ProviderRuntimeState,
   ReviewMode,
@@ -51,6 +53,16 @@ export interface UserInterventionRequest {
   coordinatorProvider: ProviderId;
 }
 
+interface BuiltPrompt {
+  text: string;
+  promptKind: PromptMetrics["promptKind"];
+  contextProfile: CompileContextProfile;
+  contextChars: number;
+  historyChars: number;
+  notionBriefChars: number;
+  discussionLedgerChars: number;
+}
+
 export class ReviewOrchestrator {
   constructor(
     private readonly storage: ForJobStorage,
@@ -88,12 +100,15 @@ export class ReviewOrchestrator {
       selectedDocumentIds: request.selectedDocumentIds,
       question: request.question,
       draft: request.draft,
-      charLimit: request.charLimit ?? project.charLimit
+      charLimit: request.charLimit ?? project.charLimit,
+      profile: "full"
     });
     const trimmedContinuationNote = request.continuationNote?.trim() || undefined;
+    const normalizedNotionRequest = normalizeNotionRequest(request.notionRequest);
+    const derivedNotionRequest = normalizeNotionRequest(deriveImplicitNotionRequest(trimmedContinuationNote));
     const effectiveNotionRequest =
-      request.notionRequest?.trim() ||
-      deriveImplicitNotionRequest(trimmedContinuationNote) ||
+      normalizedNotionRequest ||
+      derivedNotionRequest ||
       buildAutoNotionRequest(project.notionPageIds);
     const continuationContext = request.continuationFromRunId
       ? await this.storage.loadRunContinuationContext(request.projectSlug, request.continuationFromRunId)
@@ -139,7 +154,8 @@ export class ReviewOrchestrator {
 
     const turns: ReviewTurn[] = [];
     const activeReviewers = requestedReviewers.filter((reviewer) => stateMap.get(reviewer.providerId)?.authStatus === "healthy");
-    let notionBrief = "";
+    const compiledContextCache = new Map<string, string>();
+    let notionBriefFull = "";
     const userInterventions: Array<{ round: number; text: string }> = [];
     let discussionLedger: DiscussionLedger | undefined;
 
@@ -150,7 +166,22 @@ export class ReviewOrchestrator {
       }
 
       if (effectiveNotionRequest) {
-        const notionPrompt = buildNotionPrePassPrompt(initialContextMarkdown, effectiveNotionRequest);
+        const notionCompiled = await this.compiler.compile({
+          project,
+          profileDocuments,
+          projectDocuments,
+          selectedDocumentIds: request.selectedDocumentIds,
+          question: request.question,
+          draft: request.draft,
+          charLimit: request.charLimit ?? project.charLimit,
+          profile: "minimal"
+        });
+        const notionContextMarkdown = appendContinuationContext(
+          notionCompiled.markdown,
+          continuationContext,
+          trimmedContinuationNote
+        );
+        const notionPrompt = buildNotionPrePassPrompt(notionContextMarkdown, effectiveNotionRequest);
         const notionTurn = await this.executeTurn(
           request.projectSlug,
           runId,
@@ -166,17 +197,33 @@ export class ReviewOrchestrator {
           throw new Error(notionTurn.error ?? "Coordinator failed to resolve the Notion request.");
         }
 
-        notionBrief = extractNotionBrief(notionTurn.response);
+        notionBriefFull = extractNotionBrief(notionTurn.response);
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "notion-brief.md", notionTurn.response);
         run = await this.storage.updateRun(request.projectSlug, runId, {
-          notionBrief
+          notionBrief: compressNotionBrief(notionBriefFull, "compact")
         });
       }
 
       const interactiveMode = Boolean(requestUserIntervention);
       const autoCycleLimit = Math.max(1, request.rounds || 1);
+      const savePromptMetricsArtifact = async () => {
+        const promptMetrics = turns
+          .map((turn) => turn.promptMetrics)
+          .filter((metrics): metrics is PromptMetrics => Boolean(metrics));
+        if (promptMetrics.length === 0) {
+          return;
+        }
+
+        await this.storage.saveRunTextArtifact(
+          request.projectSlug,
+          runId,
+          "prompt-metrics.json",
+          JSON.stringify(promptMetrics, null, 2)
+        );
+      };
       const persistTurnsAndChat = async () => {
         await this.storage.saveReviewTurns(request.projectSlug, runId, turns);
+        await savePromptMetricsArtifact();
         if (chatMessages.size > 0) {
           await this.storage.saveRunChatMessages(request.projectSlug, runId, [...chatMessages.values()]);
         }
@@ -186,30 +233,44 @@ export class ReviewOrchestrator {
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "improvement-plan.md", artifacts.improvementPlan);
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "revised-draft.md", artifacts.revisedDraft);
       };
-      const buildCompiledContextMarkdown = async (draft: string, round: number, unitLabel: "cycle" | "round") => {
-        const compiled = await this.compiler.compile({
-          project,
-          profileDocuments,
-          projectDocuments,
-          selectedDocumentIds: request.selectedDocumentIds,
-          question: request.question,
-          draft,
-          charLimit: request.charLimit ?? project.charLimit
-        });
-        const compiledContextMarkdown = appendContinuationContext(
-          compiled.markdown,
-          continuationContext,
-          trimmedContinuationNote
-        );
-
-        await this.storage.saveRunTextArtifact(request.projectSlug, runId, "compiled-context.md", compiledContextMarkdown);
-        if (round > 1) {
-          await eventSink({
-            timestamp: nowIso(),
-            type: "compiled-context",
-            round,
-            message: `Compiled context refreshed for ${unitLabel} ${round}`
+      const buildCompiledContextMarkdown = async (
+        draft: string,
+        round: number,
+        unitLabel: "cycle" | "round",
+        profile: CompileContextProfile,
+        options: { saveArtifact?: boolean } = {}
+      ) => {
+        const cacheKey = `${profile}::${draft}`;
+        let compiledContextMarkdown = compiledContextCache.get(cacheKey);
+        if (!compiledContextMarkdown) {
+          const compiled = await this.compiler.compile({
+            project,
+            profileDocuments,
+            projectDocuments,
+            selectedDocumentIds: request.selectedDocumentIds,
+            question: request.question,
+            draft,
+            charLimit: request.charLimit ?? project.charLimit,
+            profile
           });
+          compiledContextMarkdown = appendContinuationContext(
+            compiled.markdown,
+            continuationContext,
+            trimmedContinuationNote
+          );
+          compiledContextCache.set(cacheKey, compiledContextMarkdown);
+        }
+
+        if (options.saveArtifact ?? profile !== "minimal") {
+          await this.storage.saveRunTextArtifact(request.projectSlug, runId, "compiled-context.md", compiledContextMarkdown);
+          if (round > 1) {
+            await eventSink({
+              timestamp: nowIso(),
+              type: "compiled-context",
+              round,
+              message: `Compiled context refreshed for ${unitLabel} ${round} (${profile})`
+            });
+          }
         }
 
         return compiledContextMarkdown;
@@ -323,6 +384,8 @@ export class ReviewOrchestrator {
           // Keep ledger persistence best-effort so a save failure does not fail the run.
         }
       };
+      const getNotionBriefForProfile = (profile: CompileContextProfile) =>
+        notionBriefFull ? compressNotionBrief(notionBriefFull, profile) : "";
 
       if (trimmedContinuationNote) {
         userInterventions.push({ round: 0, text: trimmedContinuationNote });
@@ -343,7 +406,7 @@ export class ReviewOrchestrator {
         let latestArtifacts: RunArtifacts | undefined;
 
         while (true) {
-          const compiledContextMarkdown = await buildCompiledContextMarkdown(currentDraft, cycle, "cycle");
+          const compiledContextMarkdown = await buildCompiledContextMarkdown(currentDraft, cycle, "cycle", "full");
           const completedReviewerTurns = turns.filter((turn) => turn.status === "completed" && turn.role === "reviewer");
           const currentCycleReviewerTurns: ReviewTurn[] = [];
 
@@ -355,7 +418,7 @@ export class ReviewOrchestrator {
 
             const prompt = buildReviewerPrompt(
               compiledContextMarkdown,
-              notionBrief,
+              getNotionBriefForProfile("full"),
               completedReviewerTurns,
               cycle,
               reviewer.participantId,
@@ -391,7 +454,7 @@ export class ReviewOrchestrator {
 
           const coordinatorPrompt = buildCoordinatorPrompt(
             compiledContextMarkdown,
-            notionBrief,
+            getNotionBriefForProfile("full"),
             userInterventions,
             currentCycleReviewerTurns,
             latestArtifacts
@@ -485,7 +548,7 @@ export class ReviewOrchestrator {
         ): Promise<ReviewTurn> => {
           const redirectPrompt = buildRealtimeCoordinatorRedirectPrompt(
             compiledContextMarkdown,
-            notionBrief,
+            getNotionBriefForProfile("compact"),
             userInterventions,
             turns.filter((turn) => turn.status === "completed"),
             nextRound,
@@ -512,14 +575,14 @@ export class ReviewOrchestrator {
 
         roundLoop:
         while (true) {
-          const compiledContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round");
+          const compiledContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "compact");
           let coordinatorTurn = seededCoordinatorTurn;
           seededCoordinatorTurn = undefined;
           if (!coordinatorTurn) {
             const completedTurns = turns.filter((turn) => turn.status === "completed");
             const coordinatorPrompt = buildRealtimeCoordinatorDiscussionPrompt(
               compiledContextMarkdown,
-              notionBrief,
+              getNotionBriefForProfile("compact"),
               userInterventions,
               completedTurns,
               round,
@@ -547,12 +610,19 @@ export class ReviewOrchestrator {
           if (queuedMessages.length > 0) {
             await emitUserMessages(round, queuedMessages);
             round += 1;
-            const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round");
+            const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "compact");
             seededCoordinatorTurn = await runRealtimeRedirectCoordinatorTurn(round, redirectContextMarkdown, queuedMessages);
             await persistTurnsAndChat();
             continue;
           }
 
+          const reviewerContextMarkdown = await buildCompiledContextMarkdown(
+            currentDraft,
+            round,
+            "round",
+            "minimal",
+            { saveArtifact: false }
+          );
           const currentRoundReviewerTurns: ReviewTurn[] = [];
           for (const reviewer of [...activeReviewers]) {
             const state = stateMap.get(reviewer.providerId);
@@ -561,8 +631,8 @@ export class ReviewOrchestrator {
             }
 
             const prompt = buildRealtimeReviewerPrompt(
-              compiledContextMarkdown,
-              notionBrief,
+              reviewerContextMarkdown,
+              getNotionBriefForProfile("minimal"),
               userInterventions,
               turns.filter((turn) => turn.status === "completed"),
               round,
@@ -599,7 +669,7 @@ export class ReviewOrchestrator {
             if (queuedMessages.length > 0) {
               await emitUserMessages(round, queuedMessages);
               round += 1;
-              const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round");
+              const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "compact");
               seededCoordinatorTurn = await runRealtimeRedirectCoordinatorTurn(round, redirectContextMarkdown, queuedMessages);
               await persistTurnsAndChat();
               continue roundLoop;
@@ -620,7 +690,7 @@ export class ReviewOrchestrator {
             // 너무 이른 합의 — devil's advocate 발동
             const challengePrompt = buildDevilsAdvocatePrompt(
               compiledContextMarkdown,
-              notionBrief,
+              getNotionBriefForProfile("compact"),
               userInterventions,
               turns.filter((t) => t.status === "completed"),
               round,
@@ -646,9 +716,10 @@ export class ReviewOrchestrator {
           }
 
           if (unanimousApproval && ledgerReadyForFinalDraft) {
+            const finalContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "full");
             const finalPrompt = buildRealtimeFinalDraftPrompt(
-              compiledContextMarkdown,
-              notionBrief,
+              finalContextMarkdown,
+              getNotionBriefForProfile("full"),
               userInterventions,
               turns.filter((turn) => turn.status === "completed"),
               discussionLedger
@@ -674,7 +745,7 @@ export class ReviewOrchestrator {
             if (queuedMessages.length > 0) {
               await emitUserMessages(round, queuedMessages);
               round += 1;
-              const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round");
+              const redirectContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "compact");
               seededCoordinatorTurn = await runRealtimeRedirectCoordinatorTurn(round, redirectContextMarkdown, queuedMessages);
               await persistTurnsAndChat();
               continue;
@@ -799,38 +870,52 @@ export class ReviewOrchestrator {
     runId: string,
     participant: ReviewParticipant,
     round: number,
-    prompt: string,
+    prompt: BuiltPrompt,
     state: ProviderRuntimeState,
     onEvent?: (event: RunEvent) => Promise<void> | void,
     messageScope?: string
   ): Promise<ReviewTurn> {
     const startedAt = nowIso();
     const scopedMessageScope = `run-${runId}-${messageScope ?? `round-${round}-${participant.role}`}-${participant.participantId}`;
+    const promptMetrics = finalizePromptMetrics(prompt);
     const turn: ReviewTurn = {
       providerId: participant.providerId,
       participantId: participant.participantId,
       participantLabel: participant.participantLabel,
       role: participant.role,
       round,
-      prompt,
+      prompt: prompt.text,
+      promptMetrics,
       response: "",
       startedAt,
       status: "completed"
     };
 
-      await this.recordEvent(projectSlug, runId, {
-        timestamp: startedAt,
-        type: "turn-started",
-        providerId: participant.providerId,
-        participantId: participant.participantId,
-        participantLabel: participant.participantLabel,
-        round,
-        speakerRole: participant.role,
-        message: `${participant.role} turn started`
-      }, onEvent);
+    await this.recordEvent(projectSlug, runId, {
+      timestamp: startedAt,
+      type: "prompt-metrics",
+      providerId: participant.providerId,
+      participantId: participant.participantId,
+      participantLabel: participant.participantLabel,
+      round,
+      speakerRole: participant.role,
+      message: `${prompt.promptKind} prompt metrics recorded`,
+      promptMetrics
+    }, onEvent);
+    await this.recordEvent(projectSlug, runId, {
+      timestamp: startedAt,
+      type: "turn-started",
+      providerId: participant.providerId,
+      participantId: participant.participantId,
+      participantLabel: participant.participantLabel,
+      round,
+      speakerRole: participant.role,
+      message: `${participant.role} turn started`,
+      promptMetrics
+    }, onEvent);
 
     try {
-      const result = await this.gateway.execute(participant.providerId, prompt, {
+      const result = await this.gateway.execute(participant.providerId, prompt.text, {
         cwd: this.storage.storageRoot,
         authMode: state.authMode,
         apiKey: await this.gateway.getApiKey(participant.providerId),
@@ -946,6 +1031,43 @@ function providerLabel(providerId?: ProviderId): string {
   }
 }
 
+function buildPrompt(options: {
+  promptKind: PromptMetrics["promptKind"];
+  contextProfile: CompileContextProfile;
+  contextMarkdown: string;
+  notionBrief?: string;
+  historyBlocks?: string[];
+  discussionLedgerBlock?: string;
+  sections: Array<string | undefined>;
+}): BuiltPrompt {
+  return {
+    text: options.sections.filter(Boolean).join("\n"),
+    promptKind: options.promptKind,
+    contextProfile: options.contextProfile,
+    contextChars: options.contextMarkdown.length,
+    historyChars: sumPromptBlockChars(options.historyBlocks),
+    notionBriefChars: options.notionBrief?.trim().length ?? 0,
+    discussionLedgerChars: options.discussionLedgerBlock?.length ?? 0
+  };
+}
+
+function sumPromptBlockChars(blocks: Array<string | undefined> = []): number {
+  return blocks.reduce((sum, block) => sum + (block?.length ?? 0), 0);
+}
+
+function finalizePromptMetrics(prompt: BuiltPrompt): PromptMetrics {
+  return {
+    promptKind: prompt.promptKind,
+    contextProfile: prompt.contextProfile,
+    promptChars: prompt.text.length,
+    estimatedPromptTokens: Math.ceil(prompt.text.length / 4),
+    contextChars: prompt.contextChars,
+    historyChars: prompt.historyChars,
+    notionBriefChars: prompt.notionBriefChars,
+    discussionLedgerChars: prompt.discussionLedgerChars
+  };
+}
+
 function buildReviewerPrompt(
   contextMarkdown: string,
   notionBrief: string,
@@ -955,7 +1077,7 @@ function buildReviewerPrompt(
   latestArtifacts?: RunArtifacts,
   userInterventions: Array<{ round: number; text: string }> = [],
   perspective?: ReviewerPerspective
-): string {
+): BuiltPrompt {
   // 같은 라운드의 다른 리뷰어 응답은 보이지 않게 한다 — 독립 평가 보장
   const visibleTurns = allTurns.filter((turn) => {
     if (turn.round === round && turn.role === "reviewer" && turn.participantId !== currentParticipantId) {
@@ -971,8 +1093,15 @@ function buildReviewerPrompt(
   const perspectiveInstruction = getPerspectiveInstruction(perspective);
   const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
   const guidanceBlock = buildUserGuidanceBlock(userInterventions);
+  const previousBlock = previous ? "## Prior Reviewer Notes\n\n" + previous : "## Prior Reviewer Notes\n\n_No prior reviewer notes yet._";
 
-  return [
+  return buildPrompt({
+    promptKind: "deep-reviewer",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, previousBlock],
+    sections: [
     "You are an essay reviewer collaborating with other model reviewers.",
     buildStructuredKoreanResponseInstruction(),
     perspectiveInstruction,
@@ -994,10 +1123,11 @@ function buildReviewerPrompt(
     sessionSnapshot ? "" : "",
     guidanceBlock,
     guidanceBlock ? "" : "",
-    previous ? "## Prior Reviewer Notes\n\n" + previous : "## Prior Reviewer Notes\n\n_No prior reviewer notes yet._",
+    previousBlock,
     "",
     "Prioritize concrete, evidence-based feedback tied to your assigned lens."
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function getPerspectiveInstruction(perspective?: ReviewerPerspective): string {
@@ -1039,10 +1169,11 @@ function buildCoordinatorPrompt(
   userInterventions: Array<{ round: number; text: string }>,
   turns: ReviewTurn[],
   latestArtifacts?: RunArtifacts
-): string {
+): BuiltPrompt {
   const discussion = turns
     .map((turn) => `## ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
     .join("\n\n");
+  const discussionBlock = `## Reviewer Discussion For This Cycle\n${discussion}`;
   const interventionBlock = buildUserGuidanceBlock(userInterventions);
   const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
   const hasUserGuidance = userInterventions.length > 0;
@@ -1063,7 +1194,13 @@ function buildCoordinatorPrompt(
         "## Revised Draft"
       ];
 
-  return [
+  return buildPrompt({
+    promptKind: "deep-coordinator",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, discussionBlock],
+    sections: [
     "You are the coordinator for an ongoing multi-model essay feedback session.",
     buildStructuredKoreanResponseInstruction(),
     "Update the current session outputs using the latest reviewer discussion.",
@@ -1078,11 +1215,11 @@ function buildCoordinatorPrompt(
     sessionSnapshot ? "" : "",
     interventionBlock,
     interventionBlock ? "" : "",
-    "## Reviewer Discussion For This Cycle",
-    discussion,
+    discussionBlock,
     "",
     "Keep the revised draft aligned with the latest voice and structure while fixing the highest-priority issues."
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function buildRealtimeCoordinatorDiscussionPrompt(
@@ -1092,14 +1229,21 @@ function buildRealtimeCoordinatorDiscussionPrompt(
   turns: ReviewTurn[],
   round: number,
   ledger?: DiscussionLedger
-): string {
+): BuiltPrompt {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
-  const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
   const hasReviewerHistory = turns.some((turn) => turn.role === "reviewer" && turn.status === "completed" && turn.round > 0);
 
-  return [
+  return buildPrompt({
+    promptKind: "realtime-coordinator-open",
+    contextProfile: "compact",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [previousRoundBlock, historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
     "You are the coordinator for a realtime multi-model essay review discussion.",
     buildRealtimeKoreanResponseInstruction(),
     `Round: ${round}`,
@@ -1127,7 +1271,8 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function buildRealtimeCoordinatorRedirectPrompt(
@@ -1138,9 +1283,9 @@ function buildRealtimeCoordinatorRedirectPrompt(
   round: number,
   messages: string[],
   ledger?: DiscussionLedger
-): string {
+): BuiltPrompt {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
-  const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
   const userMessageBlock = [
@@ -1148,7 +1293,14 @@ function buildRealtimeCoordinatorRedirectPrompt(
     ...messages.map((message, index) => `### Message ${index + 1}\n${message}`)
   ].join("\n\n");
 
-  return [
+  return buildPrompt({
+    promptKind: "realtime-coordinator-redirect",
+    contextProfile: "compact",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [previousRoundBlock, historyBlock, userMessageBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
     "You are the coordinator for a realtime multi-model essay review discussion.",
     buildRealtimeKoreanResponseInstruction(),
     `Round: ${round}`,
@@ -1176,7 +1328,8 @@ function buildRealtimeCoordinatorRedirectPrompt(
     historyBlock,
     "",
     userMessageBlock
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function buildRealtimeReviewerPrompt(
@@ -1188,7 +1341,7 @@ function buildRealtimeReviewerPrompt(
   ledger: DiscussionLedger | undefined,
   currentParticipantId: string,
   perspective?: ReviewerPerspective
-): string {
+): BuiltPrompt {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
   // 같은 라운드의 다른 리뷰어 응답은 보이지 않게 한다 — 독립 평가 보장
   const visibleTurns = allTurns.filter((turn) => {
@@ -1197,7 +1350,10 @@ function buildRealtimeReviewerPrompt(
     }
     return true;
   });
-  const historyBlock = buildRealtimeDiscussionHistory(visibleTurns.filter((turn) => turn.role !== "coordinator" || turn.round < round));
+  const historyBlock = buildRealtimeDiscussionHistory(
+    visibleTurns.filter((turn) => turn.role !== "coordinator" || turn.round < round),
+    { maxTurns: 2, maxCharsPerTurn: 220 }
+  );
   const previousRoundBlock = buildPreviousRoundReviewerSummary(visibleTurns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger);
   const perspectiveInstruction = getPerspectiveInstruction(perspective);
@@ -1205,7 +1361,14 @@ function buildRealtimeReviewerPrompt(
     ? 'Line 3 starts with "Cross-feedback:" and explicitly agree or disagree with exactly one objection from the previous-round reviewer summary.'
     : 'Line 3 starts with "Cross-feedback:" and state that there is no previous-round objection to react to yet.';
 
-  return [
+  return buildPrompt({
+    promptKind: "realtime-reviewer",
+    contextProfile: "minimal",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [previousRoundBlock, historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
     "You are a reviewer in a realtime multi-model essay discussion.",
     buildRealtimeKoreanResponseInstruction(),
     perspectiveInstruction,
@@ -1234,7 +1397,8 @@ function buildRealtimeReviewerPrompt(
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function buildRealtimeFinalDraftPrompt(
@@ -1243,12 +1407,19 @@ function buildRealtimeFinalDraftPrompt(
   userInterventions: Array<{ round: number; text: string }>,
   turns: ReviewTurn[],
   ledger?: DiscussionLedger
-): string {
+): BuiltPrompt {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
-  const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const ledgerBlock = buildDiscussionLedgerBlock(ledger);
 
-  return [
+  return buildPrompt({
+    promptKind: "realtime-final-draft",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
     "You are the coordinator closing a realtime multi-model essay review session.",
     buildFinalEssayKoreanInstruction(),
     "Every active reviewer has approved the current direction and the remaining Open Challenges are resolved.",
@@ -1266,7 +1437,8 @@ function buildRealtimeFinalDraftPrompt(
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
 function buildDevilsAdvocatePrompt(
@@ -1276,13 +1448,20 @@ function buildDevilsAdvocatePrompt(
   turns: ReviewTurn[],
   round: number,
   ledger?: DiscussionLedger
-): string {
+): BuiltPrompt {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
-  const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
 
-  return [
+  return buildPrompt({
+    promptKind: "realtime-coordinator-challenge",
+    contextProfile: "compact",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [previousRoundBlock, historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
     "You are the coordinator for a realtime multi-model essay review.",
     buildRealtimeKoreanResponseInstruction(),
     `Round: ${round}`,
@@ -1307,15 +1486,24 @@ function buildDevilsAdvocatePrompt(
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
-  ].filter(Boolean).join("\n");
+    ]
+  });
 }
 
-function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string): string {
-  return [
+function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string): BuiltPrompt {
+  return buildPrompt({
+    promptKind: "notion-prepass",
+    contextProfile: "minimal",
+    contextMarkdown,
+    sections: [
     "You are the coordinator for a multi-model essay feedback discussion.",
     buildNotionPrePassKoreanInstruction(),
     "Before the main review starts, use your configured Notion MCP tools to resolve the user's Notion request.",
     "Search for the most relevant Notion page or database entries, then summarize only the context that will improve the essay review.",
+    "Prompt budget rules:",
+    "- Use the explicit user request and the minimal draft excerpt below as your main anchor.",
+    "- Search top 3 candidates or fewer.",
+    "- Fetch at most 2 pages unless the request is still ambiguous after that.",
     "If the best match is clearly stronger than the next candidate, resolve it directly.",
     "If the result is ambiguous, do not hallucinate certainty. Briefly mention the top candidates and produce a conservative summary.",
     "If you cannot access Notion MCP or cannot resolve the request, say so clearly in the Resolution section.",
@@ -1328,7 +1516,8 @@ function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string
     "",
     "## User Notion Request",
     notionRequest
-  ].join("\n");
+    ]
+  });
 }
 
 function buildStructuredKoreanResponseInstruction(): string {
@@ -1549,8 +1738,55 @@ function buildUserGuidanceBlock(userInterventions: Array<{ round: number; text: 
   ].join("\n\n");
 }
 
+function normalizeNotionRequest(request?: string): string | undefined {
+  const trimmed = request?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  return /[\p{L}\p{N}]/u.test(trimmed) ? trimmed : undefined;
+}
+
+function compressNotionBrief(brief: string, profile: CompileContextProfile): string {
+  const trimmed = brief.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (profile === "full") {
+    return trimmed;
+  }
+
+  const maxItems = profile === "compact" ? 5 : 3;
+  const maxChars = profile === "compact" ? 900 : 420;
+  const maxItemChars = profile === "compact" ? 180 : 130;
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^#+\s+/, "").replace(/^[-*]\s+/, "").trim())
+    .filter(Boolean);
+
+  const bullets: string[] = [];
+  for (const line of lines) {
+    const candidate = `- ${truncateContinuationText(line, maxItemChars)}`;
+    if (bullets.length >= maxItems) {
+      break;
+    }
+    if (sumPromptBlockChars([bullets.join("\n"), candidate]) > maxChars) {
+      break;
+    }
+    if (!bullets.includes(candidate)) {
+      bullets.push(candidate);
+    }
+  }
+
+  if (bullets.length === 0) {
+    return truncateContinuationText(trimmed, maxChars);
+  }
+
+  return bullets.join("\n");
+}
+
 function deriveImplicitNotionRequest(continuationNote?: string): string | undefined {
-  const trimmed = continuationNote?.trim();
+  const trimmed = normalizeNotionRequest(continuationNote);
   if (!trimmed) {
     return undefined;
   }
@@ -1566,17 +1802,22 @@ function buildAutoNotionRequest(pageIds?: string[]): string | undefined {
   return `Fetch these Notion pages and summarize relevant context: ${pageIds.join(", ")}`;
 }
 
-function buildRealtimeDiscussionHistory(turns: ReviewTurn[]): string {
+function buildRealtimeDiscussionHistory(
+  turns: ReviewTurn[],
+  options: { maxTurns?: number; maxCharsPerTurn?: number } = {}
+): string {
+  const maxTurns = Math.max(1, options.maxTurns ?? 3);
+  const maxCharsPerTurn = Math.max(80, options.maxCharsPerTurn ?? 320);
   const relevant = turns
     .filter((turn) => turn.status === "completed" && turn.round > 0)
-    .slice(-8);
+    .slice(-maxTurns);
   if (relevant.length === 0) {
     return "## Recent Discussion\n\n_No prior realtime discussion yet._";
   }
 
   return [
     "## Recent Discussion",
-    ...relevant.map((turn) => `### ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
+    ...relevant.map((turn) => `### ${turnLabel(turn)} round ${turn.round}\n${truncateContinuationText(turn.response, maxCharsPerTurn)}`)
   ].join("\n\n");
 }
 
@@ -1593,7 +1834,7 @@ function buildPreviousRoundReviewerSummary(turns: ReviewTurn[], round: number): 
     ...previousRoundTurns.map((turn) => {
       const status = extractRealtimeReviewerStatus(turn.response);
       const objection = extractReviewerObjection(turn.response);
-      return `- ${turnLabel(turn)}: ${objection} (Status: ${status})`;
+      return `- ${turnLabel(turn)}: ${truncateContinuationText(objection, 180)} (Status: ${status})`;
     })
   ].join("\n");
 }

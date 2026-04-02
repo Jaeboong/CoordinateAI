@@ -22,6 +22,9 @@ export type RunStatus = (typeof runStatuses)[number];
 export const reviewModes = ["realtime", "deepFeedback"] as const;
 export type ReviewMode = (typeof reviewModes)[number];
 
+export const compileContextProfiles = ["full", "compact", "minimal"] as const;
+export type CompileContextProfile = (typeof compileContextProfiles)[number];
+
 export type DocumentScope = "profile" | "project";
 
 export interface ProviderStatus {
@@ -108,6 +111,7 @@ export interface ReviewTurn {
   role: "reviewer" | "coordinator";
   round: number;
   prompt: string;
+  promptMetrics?: PromptMetrics;
   response: string;
   startedAt: string;
   finishedAt?: string;
@@ -124,11 +128,23 @@ export interface DiscussionLedger {
   updatedAtRound: number;
 }
 
+export interface PromptMetrics {
+  promptKind: string;
+  contextProfile: CompileContextProfile;
+  promptChars: number;
+  estimatedPromptTokens: number;
+  contextChars: number;
+  historyChars: number;
+  notionBriefChars: number;
+  discussionLedgerChars: number;
+}
+
 export interface RunEvent {
   timestamp: string;
   type:
     | "run-started"
     | "compiled-context"
+    | "prompt-metrics"
     | "turn-started"
     | "provider-stdout"
     | "provider-stderr"
@@ -151,6 +167,7 @@ export interface RunEvent {
   recipient?: string;
   message?: string;
   discussionLedger?: DiscussionLedger;
+  promptMetrics?: PromptMetrics;
 }
 
 export interface RunChatMessage {

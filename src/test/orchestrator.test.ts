@@ -301,6 +301,69 @@ test("orchestrator runs a coordinator notion pre-pass and shares the notion brie
   assert.ok(reviewerCalls.every((call) => /Do not search Notion/.test(call.prompt)));
 });
 
+test("orchestrator skips notion pre-pass for punctuation-only notion requests without fixed pages", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Naver");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, _prompt, round) => {
+    if (providerId === "claude" && round === 0) {
+      return [
+        "## Resolution",
+        "노션 확인",
+        "## Notion Brief",
+        "노션 브리프",
+        "## Sources Considered",
+        "- 페이지"
+      ].join("\n");
+    }
+
+    if (providerId === "claude") {
+      return ["## Summary", "Coordinator summary", "## Improvement Plan", "- Tighten examples", "## Revised Draft", "Updated draft"].join("\n");
+    }
+
+    return ["## Overall Verdict", "Useful", "## Strengths", "- Clear", "## Problems", "- Needs evidence", "## Suggestions", "- Add numbers", "## Direct Responses To Other Reviewers", "- Agree"].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Naver?",
+    draft: "검색과 플랫폼 문제를 풀고 싶습니다.",
+    reviewMode: "deepFeedback",
+    notionRequest: ".",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  assert.equal(
+    gateway.calls.some((call) => call.providerId === "claude" && call.round === 0),
+    false
+  );
+
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Naver?",
+    draft: "검색과 플랫폼 문제를 풀고 싶습니다.",
+    reviewMode: "deepFeedback",
+    notionRequest: "네이버 관련 노션 페이지를 찾아줘",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  assert.equal(
+    gateway.calls.some((call) => call.providerId === "claude" && call.round === 0 && /## User Notion Request/.test(call.prompt)),
+    true
+  );
+});
+
 test("orchestrator carries previous run context into a continuation run", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));

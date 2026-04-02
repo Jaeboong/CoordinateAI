@@ -1,4 +1,4 @@
-import { ContextDocument, ProjectRecord } from "./types";
+import { CompileContextProfile, ContextDocument, ProjectRecord } from "./types";
 import { ForJobStorage } from "./storage";
 
 export interface CompileContextRequest {
@@ -9,6 +9,7 @@ export interface CompileContextRequest {
   question: string;
   draft: string;
   charLimit?: number;
+  profile?: CompileContextProfile;
 }
 
 export interface CompileContextResult {
@@ -20,6 +21,7 @@ export class ContextCompiler {
   constructor(private readonly storage: ForJobStorage) {}
 
   async compile(request: CompileContextRequest): Promise<CompileContextResult> {
+    const profile = request.profile ?? "full";
     const selectedIds = new Set(request.selectedDocumentIds);
     const includedProfileDocuments = request.profileDocuments.filter(
       (document) => document.pinnedByDefault || selectedIds.has(document.id)
@@ -39,22 +41,22 @@ export class ContextCompiler {
     if (request.project.mainResponsibilities?.trim()) {
       sections.push("");
       sections.push("## Main Responsibilities");
-      sections.push(request.project.mainResponsibilities.trim());
+      sections.push(profile === "minimal" ? summarizeText(request.project.mainResponsibilities, 320) : request.project.mainResponsibilities.trim());
     }
     if (request.project.qualifications?.trim()) {
       sections.push("");
       sections.push("## Qualifications");
-      sections.push(request.project.qualifications.trim());
+      sections.push(profile === "minimal" ? summarizeText(request.project.qualifications, 320) : request.project.qualifications.trim());
     }
 
     sections.push("## Evaluation Rubric");
-    sections.push(request.project.rubric.trim() || "- No rubric configured");
+    sections.push(renderRubric(request.project.rubric.trim(), profile));
 
     sections.push("## Essay Question");
-    sections.push(request.question.trim());
+    sections.push(profile === "minimal" ? summarizeText(request.question.trim(), 480) : request.question.trim());
 
-    sections.push("## Current Draft");
-    sections.push(request.draft.trim());
+    sections.push(profile === "minimal" ? "## Current Draft Excerpt" : "## Current Draft");
+    sections.push(renderDraft(request.draft.trim(), profile));
 
     if (request.charLimit) {
       const current = request.draft.length;
@@ -71,10 +73,10 @@ export class ContextCompiler {
     }
 
     sections.push("## Common Profile Context");
-    sections.push(await this.renderDocumentSection(includedProfileDocuments));
+    sections.push(await this.renderDocumentSection(includedProfileDocuments, profile));
 
     sections.push("## Project Context");
-    sections.push(await this.renderDocumentSection(includedProjectDocuments));
+    sections.push(await this.renderDocumentSection(includedProjectDocuments, profile));
 
     return {
       markdown: sections.join("\n\n").trim(),
@@ -82,9 +84,12 @@ export class ContextCompiler {
     };
   }
 
-  private async renderDocumentSection(documents: ContextDocument[]): Promise<string> {
+  private async renderDocumentSection(documents: ContextDocument[], profile: CompileContextProfile): Promise<string> {
     if (documents.length === 0) {
       return "_No documents selected._";
+    }
+    if (profile === "minimal") {
+      return "_Document bodies omitted in minimal profile to preserve prompt budget._";
     }
 
     const chunks: string[] = [];
@@ -97,7 +102,16 @@ export class ContextCompiler {
 
       if (document.normalizedPath) {
         const content = await this.storage.readDocumentNormalizedContent(document);
-        chunks.push(content?.trim() || "_Normalized content was empty._");
+        if (!content?.trim()) {
+          chunks.push("_Normalized content was empty._");
+          continue;
+        }
+
+        chunks.push(
+          profile === "compact"
+            ? buildDocumentDigest(content, document.sourceType)
+            : content.trim()
+        );
       } else {
         chunks.push("_Raw file only. Use the stored file and note for reference._");
       }
@@ -105,4 +119,58 @@ export class ContextCompiler {
 
     return chunks.join("\n\n");
   }
+}
+
+function renderRubric(rubric: string, profile: CompileContextProfile): string {
+  if (!rubric) {
+    return "- No rubric configured";
+  }
+
+  if (profile === "full") {
+    return rubric;
+  }
+
+  return summarizeText(rubric, profile === "compact" ? 900 : 360);
+}
+
+function renderDraft(draft: string, profile: CompileContextProfile): string {
+  if (!draft) {
+    return "_No draft provided._";
+  }
+
+  if (profile === "full") {
+    return draft;
+  }
+
+  if (profile === "compact") {
+    return draft.length <= 2800 ? draft : summarizeText(draft, 2800);
+  }
+
+  return summarizeText(draft, 900);
+}
+
+function buildDocumentDigest(content: string, sourceType: ContextDocument["sourceType"]): string {
+  const normalized = content.trim();
+  if (!normalized) {
+    return "_Normalized content was empty._";
+  }
+
+  return [
+    `- Prompt digest (${sourceType}):`,
+    summarizeText(normalized, 900)
+  ].join("\n");
+}
+
+function summarizeText(text: string, maxChars: number): string {
+  const normalized = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ");
+
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
