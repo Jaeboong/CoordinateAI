@@ -36,6 +36,10 @@ export const sidebarStyles = String.raw`
         font-family: var(--vscode-font-family);
       }
 
+      body.modal-open {
+        overflow: hidden;
+      }
+
       button, input, textarea, select {
         font: inherit;
       }
@@ -272,6 +276,46 @@ export const sidebarStyles = String.raw`
         border-top: 1px solid var(--border);
       }
 
+      .collapsible-shell {
+        gap: 0;
+      }
+
+      .collapsible-toggle {
+        width: 100%;
+        border: 0;
+        padding: 0;
+        margin: 0;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .collapsible-panel {
+        display: grid;
+        grid-template-rows: 0fr;
+        opacity: 0;
+        transition: grid-template-rows 0.16s ease, opacity 0.16s ease;
+      }
+
+      .collapsible-shell.open .collapsible-panel {
+        grid-template-rows: 1fr;
+        opacity: 1;
+      }
+
+      .collapsible-panel-inner {
+        min-height: 0;
+        overflow: hidden;
+        padding-top: 0;
+        transform: translateY(-4px);
+        transition: transform 0.16s ease, padding-top 0.16s ease;
+      }
+
+      .collapsible-shell.open .collapsible-panel-inner {
+        padding-top: 10px;
+        transform: translateY(0);
+      }
+
       .project-workspace {
         display: flex;
         flex-direction: column;
@@ -293,15 +337,6 @@ export const sidebarStyles = String.raw`
       .project-fold {
         border-top: 1px solid var(--border);
         padding-top: 12px;
-      }
-
-      .project-fold summary {
-        list-style: none;
-        cursor: pointer;
-      }
-
-      .project-fold summary::-webkit-details-marker {
-        display: none;
       }
 
       .project-fold-summary {
@@ -328,19 +363,19 @@ export const sidebarStyles = String.raw`
         display: none;
       }
 
-      .project-fold[open] .project-fold-state-open {
+      .collapsible-shell.open .project-fold-state-open {
         display: inline;
       }
 
-      .project-fold[open] .project-fold-state-closed {
+      .collapsible-shell.open .project-fold-state-closed {
         display: none;
       }
 
-      .project-fold:not([open]) .project-fold-state-open {
+      .collapsible-shell:not(.open) .project-fold-state-open {
         display: none;
       }
 
-      .project-fold:not([open]) .project-fold-state-closed {
+      .collapsible-shell:not(.open) .project-fold-state-closed {
         display: inline;
       }
 
@@ -353,15 +388,14 @@ export const sidebarStyles = String.raw`
         border-radius: 999px;
         border: 1px solid var(--border);
         background: color-mix(in srgb, var(--panel) 92%, transparent);
-        transition: transform 0.16s ease, border-color 0.16s ease;
-      }
-
-      .project-fold[open] .project-fold-chevron {
-        transform: rotate(180deg);
       }
 
       .project-fold-body {
-        margin-top: 10px;
+        margin-top: 0;
+      }
+
+      .project-create-shell .collapsible-panel-inner {
+        padding-top: 0;
       }
 
       .section-heading {
@@ -375,6 +409,52 @@ export const sidebarStyles = String.raw`
         display: flex;
         flex-direction: column;
         gap: 8px;
+      }
+
+      .profile-doc-item {
+        gap: 0;
+      }
+
+      .doc-item-header {
+        align-items: flex-start;
+      }
+
+      .doc-preview-trigger {
+        width: 100%;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .doc-preview-trigger:hover .doc-preview-header strong,
+      .doc-preview-trigger:focus-visible .doc-preview-header strong {
+        color: var(--accent);
+      }
+
+      .doc-preview-trigger:focus-visible {
+        outline: 2px solid color-mix(in srgb, var(--accent) 28%, transparent);
+        outline-offset: 4px;
+        border-radius: 8px;
+      }
+
+      .doc-preview-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .doc-preview-hint {
+        flex: 0 0 auto;
+        font-size: 11px;
+        color: var(--accent);
+        border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+        border-radius: 999px;
+        padding: 4px 8px;
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
       }
 
       .run-log {
@@ -555,24 +635,30 @@ export const sidebarStyles = String.raw`
       }
 
       .run-setup-card {
-        gap: 12px;
+        gap: 0;
       }
 
       .run-setup-summary {
-        list-style: none;
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        cursor: pointer;
       }
 
-      .run-setup-summary::-webkit-details-marker {
-        display: none;
+      .run-setup-summary-meta {
+        justify-content: flex-end;
       }
 
       .run-setup-body {
-        margin-top: 4px;
+        margin-top: 0;
+      }
+
+      .collapsible-chevron {
+        transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+      }
+
+      .collapsible-shell.open .collapsible-chevron {
+        transform: rotate(180deg);
       }
 
       .conversation-composer-host {
@@ -632,6 +718,64 @@ export const sidebarStyles = String.raw`
         display: flex;
         flex-wrap: wrap;
         gap: 6px;
+      }
+
+      .discussion-ledger-summary-host[hidden] {
+        display: none;
+      }
+
+      .discussion-ledger-summary {
+        border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+        border-radius: 14px;
+        padding: 12px;
+        background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .discussion-ledger-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+
+      .discussion-ledger-block {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px;
+        background: color-mix(in srgb, var(--panel) 94%, transparent);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .discussion-ledger-label {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: var(--muted);
+      }
+
+      .discussion-ledger-value {
+        line-height: 1.5;
+      }
+
+      .discussion-ledger-value > :first-child {
+        margin-top: 0;
+      }
+
+      .discussion-ledger-value > :last-child {
+        margin-bottom: 0;
+      }
+
+      .discussion-ledger-list {
+        margin: 0;
+        padding-left: 18px;
+      }
+
+      .discussion-ledger-list li + li {
+        margin-top: 6px;
       }
 
       .activity-row {
@@ -965,6 +1109,67 @@ export const sidebarStyles = String.raw`
         justify-content: space-between;
         gap: 8px;
         flex-wrap: wrap;
+      }
+
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        padding: 18px 14px;
+        background: color-mix(in srgb, black 42%, transparent);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+      }
+
+      .modal-dialog {
+        width: min(760px, calc(100vw - 28px));
+        max-height: calc(100vh - 36px);
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: color-mix(in srgb, var(--panel) 96%, black 4%);
+        box-shadow: 0 18px 40px color-mix(in srgb, black 28%, transparent);
+      }
+
+      .modal-header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+        background: color-mix(in srgb, var(--panel) 96%, black 4%);
+      }
+
+      .modal-body {
+        padding: 16px;
+      }
+
+      .modal-close-button {
+        white-space: nowrap;
+      }
+
+      .preview-content {
+        margin: 0;
+        max-height: 420px;
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: color-mix(in srgb, var(--panel) 92%, black 6%);
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: var(--vscode-editor-font-family, monospace);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .preview-empty {
+        padding: 6px 2px 2px;
       }
 
       .hidden {

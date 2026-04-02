@@ -9,7 +9,7 @@ import {
   parseCodexNotionStatus,
   parseGeminiNotionStatus
 } from "./notionMcp";
-import { buildProviderArgs, getProviderCapabilities, normalizeProviderSettingValue } from "./providerOptions";
+import { buildProviderArgs, getProviderCapabilities, loadProviderCapabilities, normalizeProviderSettingValue } from "./providerOptions";
 import { defaultProviderCommands, resolveProviderCommand, withCommandDirectoryInPath } from "./providerCommandResolver";
 import { createProviderStreamProcessor, parseProviderFinalText } from "./providerStreaming";
 import {
@@ -76,6 +76,9 @@ export class ProviderRegistry {
       lastCheckAt: nowIso(),
       lastError: installation.error
     };
+    const capabilities = installation.installed
+      ? await loadProviderCapabilities(providerId, command)
+      : getProviderCapabilities(providerId);
 
     if (!installation.installed) {
       status = { ...status, authStatus: "unhealthy", lastError: installation.error ?? "CLI가 설치되어 있지 않습니다." };
@@ -86,7 +89,7 @@ export class ProviderRegistry {
         hasApiKey: Boolean(apiKey),
         configuredModel: this.getModel(providerId),
         configuredEffort: this.getEffort(providerId),
-        capabilities: getProviderCapabilities(providerId)
+        capabilities
       };
     }
 
@@ -99,7 +102,7 @@ export class ProviderRegistry {
         hasApiKey: false,
         configuredModel: this.getModel(providerId),
         configuredEffort: this.getEffort(providerId),
-        capabilities: getProviderCapabilities(providerId)
+        capabilities
       };
     }
 
@@ -125,7 +128,7 @@ export class ProviderRegistry {
       hasApiKey: Boolean(apiKey),
       configuredModel: this.getModel(providerId),
       configuredEffort: this.getEffort(providerId),
-      capabilities: getProviderCapabilities(providerId),
+      capabilities,
       notionMcpConfigured: this.notionStatusCache.get(providerId)?.configured,
       notionMcpConnected: this.notionStatusCache.get(providerId)?.connected,
       notionMcpMessage: this.notionStatusCache.get(providerId)?.message
@@ -290,7 +293,9 @@ export class ProviderRegistry {
     const installation = await detectInstallation(command);
     const authMode = this.getAuthMode(providerId);
     const hasApiKey = Boolean(await this.getApiKey(providerId));
-    const capabilities = getProviderCapabilities(providerId);
+    const capabilities = installation.installed
+      ? await loadProviderCapabilities(providerId, command)
+      : getProviderCapabilities(providerId);
 
     let authStatus: ProviderAuthStatus = saved?.authStatus ?? "untested";
     let lastError = saved?.lastError;

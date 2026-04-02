@@ -1,10 +1,12 @@
 import { ContextCompiler } from "./contextCompiler";
 import { ForJobStorage, RunContinuationContext } from "./storage";
 import {
+  DiscussionLedger,
   ProviderId,
   RunChatMessage,
   ProviderRuntimeState,
   ReviewMode,
+  ReviewerPerspective,
   ReviewTurn,
   RunArtifacts,
   RunEvent,
@@ -18,6 +20,7 @@ interface ReviewParticipant {
   participantLabel: string;
   providerId: ProviderId;
   role: ReviewTurn["role"];
+  perspective?: ReviewerPerspective;
 }
 
 export interface OrchestratorGateway {
@@ -84,10 +87,14 @@ export class ReviewOrchestrator {
       projectDocuments,
       selectedDocumentIds: request.selectedDocumentIds,
       question: request.question,
-      draft: request.draft
+      draft: request.draft,
+      charLimit: request.charLimit ?? project.charLimit
     });
     const trimmedContinuationNote = request.continuationNote?.trim() || undefined;
-    const effectiveNotionRequest = request.notionRequest?.trim() || deriveImplicitNotionRequest(trimmedContinuationNote);
+    const effectiveNotionRequest =
+      request.notionRequest?.trim() ||
+      deriveImplicitNotionRequest(trimmedContinuationNote) ||
+      buildAutoNotionRequest(project.notionPageIds);
     const continuationContext = request.continuationFromRunId
       ? await this.storage.loadRunContinuationContext(request.projectSlug, request.continuationFromRunId)
       : undefined;
@@ -134,6 +141,7 @@ export class ReviewOrchestrator {
     const activeReviewers = requestedReviewers.filter((reviewer) => stateMap.get(reviewer.providerId)?.authStatus === "healthy");
     let notionBrief = "";
     const userInterventions: Array<{ round: number; text: string }> = [];
+    let discussionLedger: DiscussionLedger | undefined;
 
     try {
       const coordinatorState = stateMap.get(coordinator.providerId);
@@ -185,7 +193,8 @@ export class ReviewOrchestrator {
           projectDocuments,
           selectedDocumentIds: request.selectedDocumentIds,
           question: request.question,
-          draft
+          draft,
+          charLimit: request.charLimit ?? project.charLimit
         });
         const compiledContextMarkdown = appendContinuationContext(
           compiled.markdown,
@@ -280,6 +289,40 @@ export class ReviewOrchestrator {
           await emitUserIntervention(round, message);
         }
       };
+      const updateDiscussionLedger = async (sourceTurn: ReviewTurn, nextLedger?: DiscussionLedger) => {
+        if (!nextLedger) {
+          return;
+        }
+
+        discussionLedger = nextLedger;
+        await eventSink({
+          timestamp: nowIso(),
+          type: "discussion-ledger-updated",
+          providerId: sourceTurn.providerId,
+          participantId: sourceTurn.participantId,
+          participantLabel: sourceTurn.participantLabel,
+          round: nextLedger.updatedAtRound,
+          speakerRole: sourceTurn.role,
+          message: nextLedger.currentFocus,
+          discussionLedger: nextLedger
+        });
+      };
+      const saveDiscussionLedgerArtifact = async () => {
+        if (!discussionLedger) {
+          return;
+        }
+
+        try {
+          await this.storage.saveRunTextArtifact(
+            request.projectSlug,
+            runId,
+            "discussion-ledger.md",
+            buildDiscussionLedgerArtifact(discussionLedger)
+          );
+        } catch {
+          // Keep ledger persistence best-effort so a save failure does not fail the run.
+        }
+      };
 
       if (trimmedContinuationNote) {
         userInterventions.push({ round: 0, text: trimmedContinuationNote });
@@ -315,8 +358,10 @@ export class ReviewOrchestrator {
               notionBrief,
               completedReviewerTurns,
               cycle,
+              reviewer.participantId,
               latestArtifacts,
-              userInterventions
+              userInterventions,
+              reviewer.perspective
             );
             const turn = await this.executeTurn(
               request.projectSlug,
@@ -444,7 +489,8 @@ export class ReviewOrchestrator {
             userInterventions,
             turns.filter((turn) => turn.status === "completed"),
             nextRound,
-            messages
+            messages,
+            discussionLedger
           );
           const redirectTurn = await this.executeTurn(
             request.projectSlug,
@@ -460,6 +506,7 @@ export class ReviewOrchestrator {
           if (redirectTurn.status !== "completed") {
             throw new Error(redirectTurn.error ?? "Coordinator failed to redirect the discussion.");
           }
+          await updateDiscussionLedger(redirectTurn, extractDiscussionLedger(redirectTurn.response, nextRound));
           return redirectTurn;
         };
 
@@ -475,7 +522,8 @@ export class ReviewOrchestrator {
               notionBrief,
               userInterventions,
               completedTurns,
-              round
+              round,
+              discussionLedger
             );
             coordinatorTurn = await this.executeTurn(
               request.projectSlug,
@@ -493,6 +541,7 @@ export class ReviewOrchestrator {
           if (coordinatorTurn.status !== "completed") {
             throw new Error(coordinatorTurn.error ?? "Coordinator failed to guide the realtime discussion.");
           }
+          await updateDiscussionLedger(coordinatorTurn, extractDiscussionLedger(coordinatorTurn.response, round));
 
           let queuedMessages = consumeCurrentUserMessages();
           if (queuedMessages.length > 0) {
@@ -517,7 +566,9 @@ export class ReviewOrchestrator {
               userInterventions,
               turns.filter((turn) => turn.status === "completed"),
               round,
-              coordinatorTurn.response
+              discussionLedger,
+              reviewer.participantId,
+              reviewer.perspective
             );
             const turn = await this.executeTurn(
               request.projectSlug,
@@ -561,13 +612,46 @@ export class ReviewOrchestrator {
             rounds: round
           });
 
+          const MIN_ROUNDS_BEFORE_CONSENSUS = 2;
           const reviewerStatuses = collectRealtimeReviewerStatuses(currentRoundReviewerTurns, activeReviewers);
-          if (hasRealtimeConsensus(activeReviewers, reviewerStatuses)) {
+          const unanimousApproval = hasRealtimeConsensus(activeReviewers, reviewerStatuses);
+          const ledgerReadyForFinalDraft = hasResolvedOpenChallenges(discussionLedger);
+          if (unanimousApproval && round < MIN_ROUNDS_BEFORE_CONSENSUS) {
+            // 너무 이른 합의 — devil's advocate 발동
+            const challengePrompt = buildDevilsAdvocatePrompt(
+              compiledContextMarkdown,
+              notionBrief,
+              userInterventions,
+              turns.filter((t) => t.status === "completed"),
+              round,
+              discussionLedger
+            );
+            const challengeTurn = await this.executeTurn(
+              request.projectSlug,
+              runId,
+              coordinator,
+              round,
+              challengePrompt,
+              coordinatorState,
+              eventSink,
+              `realtime-round-${round}-coordinator-challenge`
+            );
+            turns.push(challengeTurn);
+            if (challengeTurn.status === "completed") {
+              await updateDiscussionLedger(challengeTurn, extractDiscussionLedger(challengeTurn.response, round));
+            }
+            await persistTurnsAndChat();
+            round += 1;
+            continue;
+          }
+
+          if (unanimousApproval && ledgerReadyForFinalDraft) {
             const finalPrompt = buildRealtimeFinalDraftPrompt(
               compiledContextMarkdown,
               notionBrief,
               userInterventions,
-              turns.filter((turn) => turn.status === "completed")
+              turns.filter((turn) => turn.status === "completed"),
+              discussionLedger
             );
             const finalTurn = await this.executeTurn(
               request.projectSlug,
@@ -666,6 +750,9 @@ export class ReviewOrchestrator {
       } else if (finalizedRealtimeDraft) {
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "revised-draft.md", artifacts.revisedDraft);
       }
+      if (request.reviewMode === "realtime") {
+        await saveDiscussionLedgerArtifact();
+      }
 
       run = await this.storage.updateRun(request.projectSlug, runId, {
         rounds: completedRounds,
@@ -679,6 +766,20 @@ export class ReviewOrchestrator {
       await this.storage.saveReviewTurns(request.projectSlug, runId, turns);
       if (chatMessages.size > 0) {
         await this.storage.saveRunChatMessages(request.projectSlug, runId, [...chatMessages.values()]);
+      }
+      if (request.reviewMode === "realtime") {
+        try {
+          if (discussionLedger) {
+            await this.storage.saveRunTextArtifact(
+              request.projectSlug,
+              runId,
+              "discussion-ledger.md",
+              buildDiscussionLedgerArtifact(discussionLedger)
+            );
+          }
+        } catch {
+          // Preserve the original run failure if the ledger artifact cannot be written.
+        }
       }
       run = await this.storage.updateRun(request.projectSlug, runId, {
         status: "failed",
@@ -848,20 +949,33 @@ function providerLabel(providerId?: ProviderId): string {
 function buildReviewerPrompt(
   contextMarkdown: string,
   notionBrief: string,
-  turns: ReviewTurn[],
+  allTurns: ReviewTurn[],
   round: number,
+  currentParticipantId: string,
   latestArtifacts?: RunArtifacts,
-  userInterventions: Array<{ round: number; text: string }> = []
+  userInterventions: Array<{ round: number; text: string }> = [],
+  perspective?: ReviewerPerspective
 ): string {
-  const previous = turns
+  // 같은 라운드의 다른 리뷰어 응답은 보이지 않게 한다 — 독립 평가 보장
+  const visibleTurns = allTurns.filter((turn) => {
+    if (turn.round === round && turn.role === "reviewer" && turn.participantId !== currentParticipantId) {
+      return false;
+    }
+    return true;
+  });
+
+  const previous = visibleTurns
     .map((turn) => `## ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
     .slice(-4)
     .join("\n\n");
+  const perspectiveInstruction = getPerspectiveInstruction(perspective);
   const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
   const guidanceBlock = buildUserGuidanceBlock(userInterventions);
 
   return [
     "You are an essay reviewer collaborating with other model reviewers.",
+    buildStructuredKoreanResponseInstruction(),
+    perspectiveInstruction,
     "Focus on improving a job application essay draft.",
     `Cycle: ${round}`,
     "Do not search Notion or browse external sources yourself. Use only the provided context and Notion Brief.",
@@ -882,8 +996,41 @@ function buildReviewerPrompt(
     guidanceBlock ? "" : "",
     previous ? "## Prior Reviewer Notes\n\n" + previous : "## Prior Reviewer Notes\n\n_No prior reviewer notes yet._",
     "",
-    "Prioritize concrete, evidence-based feedback tied to the rubric."
+    "Prioritize concrete, evidence-based feedback tied to your assigned lens."
   ].filter(Boolean).join("\n");
+}
+
+function getPerspectiveInstruction(perspective?: ReviewerPerspective): string {
+  switch (perspective) {
+    case "technical":
+      return [
+        "Your assigned lens is TECHNICAL FIT.",
+        "Focus on: whether the draft uses job-specific keywords correctly,",
+        "whether technical claims have concrete evidence (numbers, architecture decisions, tools),",
+        "and whether the experience genuinely maps to the target role's responsibilities.",
+        "Do NOT comment on tone or emotional authenticity — another reviewer handles that."
+      ].join(" ");
+    case "interviewer":
+      return [
+        "Your assigned lens is INTERVIEWER SIMULATION.",
+        "Read the draft as a hiring manager would.",
+        "Focus on: what follow-up questions this draft would trigger,",
+        "where the logic has gaps that an interviewer would probe,",
+        "and whether the 'why this company / why this role' argument is convincing or generic.",
+        "Do NOT focus on technical keyword density — another reviewer handles that."
+      ].join(" ");
+    case "authenticity":
+      return [
+        "Your assigned lens is AUTHENTICITY & VOICE.",
+        "Focus on: whether the draft sounds like a real person or an AI template,",
+        "whether emotions and growth narrative feel genuine,",
+        "whether any sentence could be copy-pasted into a different company's application unchanged,",
+        "and whether the writer's personality comes through.",
+        "Do NOT focus on technical accuracy — another reviewer handles that."
+      ].join(" ");
+    default:
+      return "";
+  }
 }
 
 function buildCoordinatorPrompt(
@@ -898,14 +1045,30 @@ function buildCoordinatorPrompt(
     .join("\n\n");
   const interventionBlock = buildUserGuidanceBlock(userInterventions);
   const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
+  const hasUserGuidance = userInterventions.length > 0;
+
+  const sectionRequirements = hasUserGuidance
+    ? [
+        "## User Guidance Response",
+        "  - For each user guidance item, state whether you ACCEPT or ADAPT it",
+        "  - If ADAPT: explain what condition would make the user's direction work",
+        "  - Never dismiss user guidance without proposing an alternative that preserves their intent",
+        "## Summary",
+        "## Improvement Plan",
+        "## Revised Draft"
+      ]
+    : [
+        "## Summary",
+        "## Improvement Plan",
+        "## Revised Draft"
+      ];
 
   return [
     "You are the coordinator for an ongoing multi-model essay feedback session.",
+    buildStructuredKoreanResponseInstruction(),
     "Update the current session outputs using the latest reviewer discussion.",
     "Return Markdown with exactly these top-level sections:",
-    "## Summary",
-    "## Improvement Plan",
-    "## Revised Draft",
+    ...sectionRequirements,
     "",
     contextMarkdown,
     "",
@@ -927,26 +1090,40 @@ function buildRealtimeCoordinatorDiscussionPrompt(
   notionBrief: string,
   userInterventions: Array<{ round: number; text: string }>,
   turns: ReviewTurn[],
-  round: number
+  round: number,
+  ledger?: DiscussionLedger
 ): string {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
   const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
   const hasReviewerHistory = turns.some((turn) => turn.role === "reviewer" && turn.status === "completed" && turn.round > 0);
 
   return [
     "You are the coordinator for a realtime multi-model essay review discussion.",
+    buildRealtimeKoreanResponseInstruction(),
     `Round: ${round}`,
     "This turn is facilitation only. Do not write the full essay yet.",
-    "Respond in plain Markdown with at most 3 short sentences.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Current Focus",
+    "## Target Section",
+    "## Mini Draft",
+    "## Accepted Decisions",
+    "## Open Challenges",
+    "Write Current Focus as one line, Target Section as a short label, and Mini Draft as a 2-4 sentence candidate rewrite for only that target section.",
+    "Accepted Decisions and Open Challenges must use bullet items. If empty, write exactly '- 없음'.",
     hasReviewerHistory
-      ? "Use the latest reviewer feedback to propose the single highest-leverage next change."
-      : "Open the discussion by naming the single highest-leverage issue and asking reviewers to react.",
-    "Do not use section headings, bullet lists, or status tags.",
+      ? "Use the latest reviewer feedback and the previous ledger to move one unresolved issue closer to convergence."
+      : "Open the discussion by naming the single highest-leverage issue and proposing the first Mini Draft.",
     "",
     contextMarkdown,
     "",
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    previousRoundBlock,
+    "",
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
@@ -959,10 +1136,13 @@ function buildRealtimeCoordinatorRedirectPrompt(
   userInterventions: Array<{ round: number; text: string }>,
   turns: ReviewTurn[],
   round: number,
-  messages: string[]
+  messages: string[],
+  ledger?: DiscussionLedger
 ): string {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
   const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
   const userMessageBlock = [
     "## New User Messages",
     ...messages.map((message, index) => `### Message ${index + 1}\n${message}`)
@@ -970,17 +1150,27 @@ function buildRealtimeCoordinatorRedirectPrompt(
 
   return [
     "You are the coordinator for a realtime multi-model essay review discussion.",
+    buildRealtimeKoreanResponseInstruction(),
     `Round: ${round}`,
     "The user just redirected the discussion. Reply first and reset the direction.",
-    "Respond in plain Markdown with at most 3 short sentences.",
-    "Acknowledge the new user message, state the new focus, and give reviewers one specific thing to react to next.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Current Focus",
+    "## Target Section",
+    "## Mini Draft",
+    "## Accepted Decisions",
+    "## Open Challenges",
+    "Acknowledge the new user message by reflecting it inside Current Focus and Mini Draft.",
+    "Accepted Decisions and Open Challenges must use bullet items. If empty, write exactly '- 없음'.",
     "Do not write the full essay yet.",
-    "Do not use section headings, bullet lists, or status tags in your response.",
     "",
     contextMarkdown,
     "",
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    previousRoundBlock,
+    "",
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock,
@@ -993,35 +1183,57 @@ function buildRealtimeReviewerPrompt(
   contextMarkdown: string,
   notionBrief: string,
   userInterventions: Array<{ round: number; text: string }>,
-  turns: ReviewTurn[],
+  allTurns: ReviewTurn[],
   round: number,
-  coordinatorMessage: string
+  ledger: DiscussionLedger | undefined,
+  currentParticipantId: string,
+  perspective?: ReviewerPerspective
 ): string {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
-  const historyBlock = buildRealtimeDiscussionHistory(turns.filter((turn) => turn.role !== "coordinator" || turn.round < round));
+  // 같은 라운드의 다른 리뷰어 응답은 보이지 않게 한다 — 독립 평가 보장
+  const visibleTurns = allTurns.filter((turn) => {
+    if (turn.round === round && turn.role === "reviewer" && turn.participantId !== currentParticipantId) {
+      return false;
+    }
+    return true;
+  });
+  const historyBlock = buildRealtimeDiscussionHistory(visibleTurns.filter((turn) => turn.role !== "coordinator" || turn.round < round));
+  const previousRoundBlock = buildPreviousRoundReviewerSummary(visibleTurns, round);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger);
+  const perspectiveInstruction = getPerspectiveInstruction(perspective);
+  const crossFeedbackInstruction = round > 1
+    ? 'Line 3 starts with "Cross-feedback:" and explicitly agree or disagree with exactly one objection from the previous-round reviewer summary.'
+    : 'Line 3 starts with "Cross-feedback:" and state that there is no previous-round objection to react to yet.';
 
   return [
     "You are a reviewer in a realtime multi-model essay discussion.",
+    buildRealtimeKoreanResponseInstruction(),
+    perspectiveInstruction,
     `Round: ${round}`,
-    "Respond directly to the coordinator's latest proposal.",
-    "Use at most 2 short sentences, then end with exactly one final status line.",
+    "Review the coordinator's current discussion ledger, especially the Mini Draft.",
+    "Keep the blind review rule: do not assume anything about same-round reviewer replies that are not shown below.",
+    "Respond in exactly 3 short labeled lines plus one final status line.",
+    'Line 1 starts with "Mini Draft:" and identify one phrase or sentence in the Mini Draft to keep or revise.',
+    'Line 2 starts with "Challenge:" and say whether one Open Challenge should be closed now or remain open.',
+    crossFeedbackInstruction,
     "The final line must be exactly one of these:",
     "Status: APPROVE",
     "Status: REVISE",
     "Status: BLOCK",
-    "Use APPROVE only if the latest direction is ready for a final rewrite. If unsure, use REVISE.",
+    "Use APPROVE only if the Mini Draft direction is ready for a final rewrite and no Open Challenge should remain open.",
     "Do not use headings or bullet lists.",
     "",
     contextMarkdown,
     "",
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    previousRoundBlock,
+    "",
     guidanceBlock,
     guidanceBlock ? "" : "",
-    historyBlock,
-    "",
-    "## Coordinator Note",
-    coordinatorMessage
+    historyBlock
   ].filter(Boolean).join("\n");
 }
 
@@ -1029,15 +1241,19 @@ function buildRealtimeFinalDraftPrompt(
   contextMarkdown: string,
   notionBrief: string,
   userInterventions: Array<{ round: number; text: string }>,
-  turns: ReviewTurn[]
+  turns: ReviewTurn[],
+  ledger?: DiscussionLedger
 ): string {
   const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
   const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger);
 
   return [
     "You are the coordinator closing a realtime multi-model essay review session.",
-    "Every active reviewer has approved the current direction.",
+    buildFinalEssayKoreanInstruction(),
+    "Every active reviewer has approved the current direction and the remaining Open Challenges are resolved.",
     "Write the final polished essay draft now.",
+    "Use the Mini Draft as the local seed, preserve the Accepted Decisions, and keep the final essay aligned with the resolved focus.",
     "Return only the rewritten essay in Markdown.",
     "Do not include section headings, status tags, summaries, or extra commentary.",
     "",
@@ -1045,6 +1261,49 @@ function buildRealtimeFinalDraftPrompt(
     "",
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    historyBlock
+  ].filter(Boolean).join("\n");
+}
+
+function buildDevilsAdvocatePrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  turns: ReviewTurn[],
+  round: number,
+  ledger?: DiscussionLedger
+): string {
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
+  const historyBlock = buildRealtimeDiscussionHistory(turns);
+  const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
+
+  return [
+    "You are the coordinator for a realtime multi-model essay review.",
+    buildRealtimeKoreanResponseInstruction(),
+    `Round: ${round}`,
+    "All reviewers agreed too quickly. This often means groupthink.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Current Focus",
+    "## Target Section",
+    "## Mini Draft",
+    "## Accepted Decisions",
+    "## Open Challenges",
+    "Use this turn to challenge one assumption the reviewers accepted too quickly and add at least one concrete Open Challenge.",
+    "Do not write the full essay.",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    previousRoundBlock,
+    "",
     guidanceBlock,
     guidanceBlock ? "" : "",
     historyBlock
@@ -1054,6 +1313,7 @@ function buildRealtimeFinalDraftPrompt(
 function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string): string {
   return [
     "You are the coordinator for a multi-model essay feedback discussion.",
+    buildNotionPrePassKoreanInstruction(),
     "Before the main review starts, use your configured Notion MCP tools to resolve the user's Notion request.",
     "Search for the most relevant Notion page or database entries, then summarize only the context that will improve the essay review.",
     "If the best match is clearly stronger than the next candidate, resolve it directly.",
@@ -1069,6 +1329,126 @@ function buildNotionPrePassPrompt(contextMarkdown: string, notionRequest: string
     "## User Notion Request",
     notionRequest
   ].join("\n");
+}
+
+function buildStructuredKoreanResponseInstruction(): string {
+  return [
+    "IMPORTANT: Write all substantive content in Korean (한국어).",
+    "Keep the required English section headings exactly as written.",
+    "Do not switch to English unless the user explicitly asks for it."
+  ].join(" ");
+}
+
+function buildRealtimeKoreanResponseInstruction(): string {
+  return [
+    "IMPORTANT: Write your response sentences in Korean (한국어).",
+    "Keep any required English status line exactly as written.",
+    "Do not switch to English unless the user explicitly asks for it."
+  ].join(" ");
+}
+
+function buildFinalEssayKoreanInstruction(): string {
+  return "IMPORTANT: Write the final essay draft in Korean (한국어) unless the user explicitly asks for another language.";
+}
+
+function buildNotionPrePassKoreanInstruction(): string {
+  return [
+    "IMPORTANT: Write all substantive content in Korean (한국어).",
+    "Keep the required English top-level section headings exactly as written.",
+    "Do not switch to English unless the user explicitly asks for it."
+  ].join(" ");
+}
+
+function buildDiscussionLedgerBlock(ledger?: DiscussionLedger, heading = "## Discussion Ledger"): string {
+  if (!ledger) {
+    return `${heading}\n\n_No discussion ledger yet._`;
+  }
+
+  return [
+    heading,
+    `- Updated At Round: ${ledger.updatedAtRound}`,
+    `- Target Section: ${ledger.targetSection}`,
+    "",
+    "### Current Focus",
+    ledger.currentFocus,
+    "",
+    "### Mini Draft",
+    ledger.miniDraft,
+    "",
+    "### Accepted Decisions",
+    ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
+    "",
+    "### Open Challenges",
+    ...formatDiscussionLedgerItems(ledger.openChallenges)
+  ].join("\n");
+}
+
+function buildDiscussionLedgerArtifact(ledger: DiscussionLedger): string {
+  return [
+    "# Discussion Ledger",
+    "",
+    `- Updated At Round: ${ledger.updatedAtRound}`,
+    `- Target Section: ${ledger.targetSection}`,
+    "",
+    "## Current Focus",
+    ledger.currentFocus,
+    "",
+    "## Mini Draft",
+    ledger.miniDraft,
+    "",
+    "## Accepted Decisions",
+    ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
+    "",
+    "## Open Challenges",
+    ...formatDiscussionLedgerItems(ledger.openChallenges)
+  ].join("\n");
+}
+
+function formatDiscussionLedgerItems(items: string[]): string[] {
+  return items.length > 0 ? items.map((item) => `- ${item}`) : ["- 없음"];
+}
+
+function extractDiscussionLedger(output: string, round: number): DiscussionLedger | undefined {
+  const currentFocus = normalizeLedgerSingleLine(extractMarkdownSection(output, "Current Focus"));
+  const targetSection = normalizeLedgerSingleLine(extractMarkdownSection(output, "Target Section"));
+  const miniDraft = normalizeLedgerParagraph(extractMarkdownSection(output, "Mini Draft"));
+  if (!currentFocus || !targetSection || !miniDraft) {
+    return undefined;
+  }
+
+  return {
+    currentFocus,
+    miniDraft,
+    acceptedDecisions: parseDiscussionLedgerItems(extractMarkdownSection(output, "Accepted Decisions")),
+    openChallenges: parseDiscussionLedgerItems(extractMarkdownSection(output, "Open Challenges")),
+    targetSection,
+    updatedAtRound: round
+  };
+}
+
+function normalizeLedgerSingleLine(section: string): string {
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? "";
+}
+
+function normalizeLedgerParagraph(section: string): string {
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .join("\n")
+    .trim();
+}
+
+function parseDiscussionLedgerItems(section: string): string[] {
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !/^없음$/i.test(line));
 }
 
 function extractNotionBrief(response: string): string {
@@ -1156,6 +1536,11 @@ function buildUserGuidanceBlock(userInterventions: Array<{ round: number; text: 
 
   return [
     "## User Guidance",
+    "IMPORTANT: The user (essay author) has provided direct guidance below.",
+    "The user knows their own experience better than any reviewer.",
+    "If the user disagrees with a reviewer consensus, explore HOW to make the user's preferred direction work rather than dismissing it.",
+    "Only push back if the user's direction has a factual or logical problem that cannot be resolved by better writing.",
+    "",
     ...userInterventions.slice(-6).map((item) =>
       item.round <= 0
         ? `### Before Start\n${item.text}`
@@ -1173,6 +1558,14 @@ function deriveImplicitNotionRequest(continuationNote?: string): string | undefi
   return /(?:\bnotion\b|노션)/i.test(trimmed) ? trimmed : undefined;
 }
 
+function buildAutoNotionRequest(pageIds?: string[]): string | undefined {
+  if (!pageIds || pageIds.length === 0) {
+    return undefined;
+  }
+
+  return `Fetch these Notion pages and summarize relevant context: ${pageIds.join(", ")}`;
+}
+
 function buildRealtimeDiscussionHistory(turns: ReviewTurn[]): string {
   const relevant = turns
     .filter((turn) => turn.status === "completed" && turn.round > 0)
@@ -1185,6 +1578,45 @@ function buildRealtimeDiscussionHistory(turns: ReviewTurn[]): string {
     "## Recent Discussion",
     ...relevant.map((turn) => `### ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
   ].join("\n\n");
+}
+
+function buildPreviousRoundReviewerSummary(turns: ReviewTurn[], round: number): string {
+  const previousRoundTurns = turns.filter(
+    (turn) => turn.status === "completed" && turn.role === "reviewer" && turn.round === round - 1
+  );
+  if (previousRoundTurns.length === 0) {
+    return "## Previous Round Reviewer Summary\n\n_No previous-round reviewer objections yet._";
+  }
+
+  return [
+    "## Previous Round Reviewer Summary",
+    ...previousRoundTurns.map((turn) => {
+      const status = extractRealtimeReviewerStatus(turn.response);
+      const objection = extractReviewerObjection(turn.response);
+      return `- ${turnLabel(turn)}: ${objection} (Status: ${status})`;
+    })
+  ].join("\n");
+}
+
+function extractReviewerObjection(response: string): string {
+  const preferred = [
+    extractMarkdownSection(response, "Problems"),
+    extractMarkdownSection(response, "Suggestions"),
+    response
+  ];
+
+  for (const block of preferred) {
+    const line = block
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .map((item) => item.replace(/^[-*]\s+/, "").trim())
+      .find((item) => item.length > 0 && !/^status:/i.test(item));
+    if (line) {
+      return line;
+    }
+  }
+
+  return "핵심 objection이 명확히 드러나지 않았습니다.";
 }
 
 type RealtimeReviewerStatus = "APPROVE" | "REVISE" | "BLOCK";
@@ -1220,6 +1652,10 @@ function hasRealtimeConsensus(
   statuses: Map<string, RealtimeReviewerStatus>
 ): boolean {
   return activeReviewers.length > 0 && activeReviewers.every((reviewer) => statuses.get(reviewer.participantId) === "APPROVE");
+}
+
+function hasResolvedOpenChallenges(ledger?: DiscussionLedger): boolean {
+  return ledger !== undefined && ledger.openChallenges.length === 0;
 }
 
 function appendContinuationContext(
@@ -1299,6 +1735,8 @@ function buildCoordinatorParticipant(providerId: ProviderId): ReviewParticipant 
   };
 }
 
+const REVIEWER_PERSPECTIVES: ReviewerPerspective[] = ["technical", "interviewer", "authenticity"];
+
 function buildReviewerParticipants(providerIds: ProviderId[]): ReviewParticipant[] {
   const totals = new Map<ProviderId, number>();
   for (const providerId of providerIds) {
@@ -1310,11 +1748,13 @@ function buildReviewerParticipants(providerIds: ProviderId[]): ReviewParticipant
     const next = (seen.get(providerId) ?? 0) + 1;
     seen.set(providerId, next);
     const duplicateCount = totals.get(providerId) ?? 1;
+    const perspective = REVIEWER_PERSPECTIVES[index % REVIEWER_PERSPECTIVES.length];
     return {
       participantId: `reviewer-${index + 1}`,
       participantLabel: duplicateCount > 1 ? `${providerLabel(providerId)} reviewer ${next}` : `${providerLabel(providerId)} reviewer`,
       providerId,
-      role: "reviewer"
+      role: "reviewer",
+      perspective
     };
   });
 }

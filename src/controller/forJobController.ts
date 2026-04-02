@@ -6,6 +6,7 @@ import { ProviderRegistry } from "../core/providers";
 import { ForJobStorage } from "../core/storage";
 import {
   ContinuationPreset,
+  ProfileDocumentPreviewPayload,
   ProjectDocumentEditorPreset,
   UploadedFile,
   WebviewToExtensionMessage,
@@ -230,6 +231,11 @@ export class ForJobController {
         await this.stateStore.refreshProfileDocuments();
       });
     },
+    openProfileDocumentPreview: async (message) => {
+      await this.runBusy("문서를 불러오는 중...", async () => {
+        await this.loadProfileDocumentPreview(message.documentId);
+      });
+    },
     toggleProjectPinned: async (message) => {
       await this.runBusy("문서 기본 포함 상태를 업데이트하는 중...", async () => {
         await this.requireStorage().setProjectDocumentPinned(message.projectSlug, message.documentId, message.pinned);
@@ -418,7 +424,8 @@ export class ForJobController {
           coordinatorProvider: message.coordinatorProvider,
           reviewerProviders: message.reviewerProviders,
           rounds: message.rounds,
-          selectedDocumentIds: message.selectedDocumentIds
+          selectedDocumentIds: message.selectedDocumentIds,
+          charLimit: message.charLimit
         },
         async (event) => {
           await this.sidebar.postRunEvent(event);
@@ -455,6 +462,23 @@ export class ForJobController {
       contentEditable
     };
     await this.sidebar.postProjectDocumentEditorPreset(preset);
+  }
+
+  private async loadProfileDocumentPreview(documentId: string): Promise<void> {
+    const document = await this.requireStorage().getProfileDocument(documentId);
+    const preview = await this.requireStorage().readDocumentPreviewContent(document);
+    const payload: ProfileDocumentPreviewPayload = {
+      documentId: document.id,
+      title: document.title,
+      note: document.note || "",
+      sourceType: document.sourceType,
+      extractionStatus: document.extractionStatus,
+      rawPath: document.rawPath,
+      normalizedPath: document.normalizedPath || "",
+      previewSource: preview.previewSource,
+      content: preview.content
+    };
+    await this.sidebar.postProfileDocumentPreview(payload);
   }
 
   private async loadRunContinuation(projectSlug: string, runId: string): Promise<void> {

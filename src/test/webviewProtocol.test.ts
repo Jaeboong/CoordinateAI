@@ -73,6 +73,89 @@ test("webview message schema accepts review mode on run and continuation payload
   assert.equal(continueMessage.runId, "run-1");
 });
 
+test("extension message schema accepts discussion ledger events and artifact flags", () => {
+  const ledgerEvent = ExtensionToWebviewMessageSchema.parse({
+    type: "runEvent",
+    payload: {
+      timestamp: "2026-04-02T00:00:00.000Z",
+      type: "discussion-ledger-updated",
+      providerId: "claude",
+      participantId: "coordinator",
+      participantLabel: "Claude coordinator",
+      round: 2,
+      speakerRole: "coordinator",
+      message: "성과 문장을 먼저 수습합니다.",
+      discussionLedger: {
+        currentFocus: "성과 문장을 먼저 수습합니다.",
+        miniDraft: "결제 안정화 경험을 문장 앞에 배치합니다.",
+        acceptedDecisions: ["성과 수치를 앞단에 둔다"],
+        openChallenges: ["회사 적합도 근거가 아직 약하다"],
+        targetSection: "지원 동기 1문단",
+        updatedAtRound: 2
+      }
+    }
+  });
+
+  assert.equal(ledgerEvent.type, "runEvent");
+  assert.equal(ledgerEvent.payload.type, "discussion-ledger-updated");
+  assert.equal(ledgerEvent.payload.discussionLedger?.targetSection, "지원 동기 1문단");
+
+  const stateMessage = ExtensionToWebviewMessageSchema.parse({
+    type: "state",
+    payload: {
+      workspaceOpened: true,
+      providers: [],
+      profileDocuments: [],
+      projects: [
+        {
+          record: {
+            projectSlug: "alpha",
+            slug: "alpha",
+            companyName: "Alpha",
+            rubric: "- fit",
+            pinnedDocumentIds: [],
+            createdAt: "2026-04-02T00:00:00.000Z",
+            updatedAt: "2026-04-02T00:00:00.000Z"
+          },
+          documents: [],
+          runs: [
+            {
+              record: {
+                id: "run-1",
+                projectSlug: "alpha",
+                question: "question",
+                draft: "draft",
+                reviewMode: "realtime",
+                coordinatorProvider: "claude",
+                reviewerProviders: ["codex"],
+                rounds: 2,
+                selectedDocumentIds: [],
+                status: "completed",
+                startedAt: "2026-04-02T00:00:00.000Z"
+              },
+              artifacts: {
+                summary: false,
+                improvementPlan: false,
+                revisedDraft: true,
+                discussionLedger: true,
+                notionBrief: false,
+                chatMessages: false,
+                events: true
+              }
+            }
+          ]
+        }
+      ],
+      preferences: {},
+      runState: { status: "idle" },
+      defaultRubric: "- fit"
+    }
+  });
+
+  assert.equal(stateMessage.type, "state");
+  assert.equal(stateMessage.payload.projects[0]?.runs[0]?.artifacts.discussionLedger, true);
+});
+
 test("webview message schema accepts structured project fields", () => {
   const createProjectMessage = WebviewToExtensionMessageSchema.parse({
     type: "createProject",
@@ -100,6 +183,29 @@ test("webview message schema accepts structured project fields", () => {
   assert.equal(updateProjectMessage.projectSlug, "gmarket-search");
   assert.equal(updateProjectMessage.mainResponsibilities, "검색 품질 향상을 위한 데이터 분석 및 개선 과제 수행");
   assert.equal(updateProjectMessage.qualifications, "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험");
+
+  const previewRequest = WebviewToExtensionMessageSchema.parse({
+    type: "openProfileDocumentPreview",
+    documentId: "doc-1"
+  });
+  assert.equal(previewRequest.type, "openProfileDocumentPreview");
+
+  const previewMessage = ExtensionToWebviewMessageSchema.parse({
+    type: "profileDocumentPreview",
+    payload: {
+      documentId: "doc-1",
+      title: "경력 요약",
+      note: "핵심 버전",
+      sourceType: "md",
+      extractionStatus: "normalized",
+      rawPath: ".forjob/profile/raw/career.txt",
+      normalizedPath: ".forjob/profile/normalized/career.md",
+      previewSource: "normalized",
+      content: "# Career"
+    }
+  });
+  assert.equal(previewMessage.type, "profileDocumentPreview");
+  assert.equal(previewMessage.payload.previewSource, "normalized");
 });
 
 test("extension message schema requires typed sidebar state payload", () => {

@@ -262,6 +262,16 @@ export class ForJobStorage {
     await this.updateProject({ ...project, pinnedDocumentIds: [...current] });
   }
 
+  async getProfileDocument(documentId: string): Promise<ContextDocument> {
+    const manifest = await this.loadManifest(this.profileManifestPath());
+    const document = manifest.documents.find((item) => item.id === documentId);
+    if (!document) {
+      throw new Error(`Profile document not found: ${documentId}`);
+    }
+
+    return document;
+  }
+
   async getProjectDocument(projectSlug: string, documentId: string): Promise<ContextDocument> {
     const manifest = await this.loadManifest(this.projectContextManifestPath(projectSlug));
     const document = manifest.documents.find((item) => item.id === documentId);
@@ -283,6 +293,22 @@ export class ForJobStorage {
     }
 
     return fs.readFile(filePath, "utf8");
+  }
+
+  async readDocumentPreviewContent(
+    document: ContextDocument
+  ): Promise<{ content: string; previewSource: "normalized" | "raw" | "none" }> {
+    const normalized = await this.readDocumentNormalizedContent(document);
+    if (typeof normalized === "string") {
+      return { content: normalized, previewSource: "normalized" };
+    }
+
+    const raw = await this.readDocumentRawContent(document);
+    if (typeof raw === "string") {
+      return { content: raw, previewSource: "raw" };
+    }
+
+    return { content: "", previewSource: "none" };
   }
 
   async updateProjectDocument(

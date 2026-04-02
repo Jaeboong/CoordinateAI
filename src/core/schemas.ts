@@ -15,6 +15,7 @@ const runEventTypes = [
   "user-input-received",
   "turn-completed",
   "turn-failed",
+  "discussion-ledger-updated",
   "run-completed",
   "run-failed"
 ] as const;
@@ -27,6 +28,14 @@ export const SourceTypeSchema = z.enum(sourceTypes);
 export const ExtractionStatusSchema = z.enum(extractionStatuses);
 export const RunStatusSchema = z.enum(runStatuses);
 export const ReviewModeSchema = z.enum(reviewModes);
+export const DiscussionLedgerSchema = z.object({
+  currentFocus: z.string(),
+  miniDraft: z.string(),
+  acceptedDecisions: z.array(z.string()),
+  openChallenges: z.array(z.string()),
+  targetSection: z.string(),
+  updatedAtRound: z.number().int().min(0)
+});
 
 export const ProviderStatusSchema = z.object({
   providerId: ProviderIdSchema,
@@ -153,5 +162,6 @@ export const RunEventSchema = z.object({
   messageId: z.string().optional(),
   speakerRole: z.enum(runChatSpeakerRoles).optional(),
   recipient: z.string().optional(),
-  message: z.string().optional()
+  message: z.string().optional(),
+  discussionLedger: DiscussionLedgerSchema.optional()
 });

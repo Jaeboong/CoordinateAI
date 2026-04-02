@@ -27,6 +27,7 @@ ${sidebarStyles}
       <div class="tabs" id="tabs"></div>
       <div id="content"></div>
     </div>
+    <div id="modal-root"></div>
     <input id="profile-file-input" class="hidden" type="file" multiple />
     <input id="project-file-input" class="hidden" type="file" multiple />
     <script nonce="${nonce}">

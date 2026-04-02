@@ -8,6 +8,7 @@ export interface CompileContextRequest {
   selectedDocumentIds: string[];
   question: string;
   draft: string;
+  charLimit?: number;
 }
 
 export interface CompileContextResult {
@@ -54,6 +55,20 @@ export class ContextCompiler {
 
     sections.push("## Current Draft");
     sections.push(request.draft.trim());
+
+    if (request.charLimit) {
+      const current = request.draft.length;
+      const remaining = request.charLimit - current;
+      sections.push("## Character Limit");
+      sections.push(
+        [
+          `Maximum: ${request.charLimit} characters (including spaces).`,
+          `Current draft: approximately ${current} characters.`,
+          `Remaining budget: approximately ${remaining} characters.`,
+          "The revised draft MUST stay within this limit. Do not exceed it."
+        ].join("\n")
+      );
+    }
 
     sections.push("## Common Profile Context");
     sections.push(await this.renderDocumentSection(includedProfileDocuments));

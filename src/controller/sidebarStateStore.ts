@@ -139,10 +139,11 @@ export class SidebarStateStore {
 
     const runPreviews = await Promise.all(
       runs.map(async (run) => {
-        const [summary, improvementPlan, revisedDraft, notionBrief, chatMessages, events] = await Promise.all([
+        const [summary, improvementPlan, revisedDraft, discussionLedger, notionBrief, chatMessages, events] = await Promise.all([
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "summary.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "improvement-plan.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "revised-draft.md"),
+          this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "discussion-ledger.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "notion-brief.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "chat-messages.json"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "events.ndjson")
@@ -155,6 +156,7 @@ export class SidebarStateStore {
             summary: Boolean(summary),
             improvementPlan: Boolean(improvementPlan),
             revisedDraft: Boolean(revisedDraft),
+            discussionLedger: Boolean(discussionLedger),
             notionBrief: Boolean(notionBrief),
             chatMessages: Boolean(chatMessages),
             events: Boolean(events)

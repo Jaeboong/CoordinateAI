@@ -5,6 +5,7 @@ import {
   ContinuationPreset,
   ExtensionToWebviewMessage,
   ExtensionToWebviewMessageSchema,
+  ProfileDocumentPreviewPayload,
   ProjectDocumentEditorPreset
 } from "../core/webviewProtocol";
 import { SidebarState } from "../core/viewModels";
@@ -50,6 +51,10 @@ export class ForJobSidebarProvider implements vscode.WebviewViewProvider {
 
   async postProjectDocumentEditorPreset(payload: ProjectDocumentEditorPreset): Promise<void> {
     await this.postMessage({ type: "projectDocumentEditorPreset", payload });
+  }
+
+  async postProfileDocumentPreview(payload: ProfileDocumentPreviewPayload): Promise<void> {
+    await this.postMessage({ type: "profileDocumentPreview", payload });
   }
 
   private async postMessage(message: ExtensionToWebviewMessage): Promise<void> {

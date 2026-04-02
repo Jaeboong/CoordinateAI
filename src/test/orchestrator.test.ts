@@ -98,6 +98,31 @@ function healthyStates(): ProviderRuntimeState[] {
   ];
 }
 
+function buildRealtimeLedgerResponse(options: {
+  currentFocus: string;
+  targetSection?: string;
+  miniDraft: string;
+  acceptedDecisions?: string[];
+  openChallenges?: string[];
+}): string {
+  return [
+    "## Current Focus",
+    options.currentFocus,
+    "",
+    "## Target Section",
+    options.targetSection || "핵심 문단",
+    "",
+    "## Mini Draft",
+    options.miniDraft,
+    "",
+    "## Accepted Decisions",
+    ...(options.acceptedDecisions && options.acceptedDecisions.length > 0 ? options.acceptedDecisions.map((item) => `- ${item}`) : ["- 없음"]),
+    "",
+    "## Open Challenges",
+    ...(options.openChallenges && options.openChallenges.length > 0 ? options.openChallenges.map((item) => `- ${item}`) : ["- 없음"])
+  ].join("\n");
+}
+
 test("orchestrator completes a run, writes artifacts, and remembers the coordinator", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));
@@ -441,6 +466,63 @@ test("continuation note that mentions notion triggers a fresh notion pre-pass an
   assert.match(reviewerCall.prompt, /Campung는 금융 해커톤이 아니라 운영 백엔드 경험으로 정리해야 합니다/);
 });
 
+test("deep feedback prompts explicitly require Korean responses while preserving English headings", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Shinhan Bank");
+  await storage.saveProfileTextDocument("Career", "Built backend systems", true);
+
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, _prompt, round) => {
+    if (providerId === "claude" && round === 0) {
+      return [
+        "## Resolution",
+        "노션 확인 완료",
+        "## Notion Brief",
+        "Campung 정정 내용",
+        "## Sources Considered",
+        "- 노션 페이지"
+      ].join("\n");
+    }
+
+    if (providerId === "claude") {
+      return ["## Summary", "정리 완료", "## Improvement Plan", "- 신한 연결 보강", "## Revised Draft", "새 초안"].join("\n");
+    }
+
+    return ["## Overall Verdict", "유용함", "## Strengths", "- 정정 반영", "## Problems", "- 신한 연결 약함", "## Suggestions", "- 동기 강화", "## Direct Responses To Other Reviewers", "- 동의"].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "왜 신한은행인가?",
+    draft: "초안",
+    reviewMode: "deepFeedback",
+    notionRequest: "Campung 내용을 노션에서 다시 확인해줘",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["gemini"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const notionCall = gateway.calls.find((call) => call.providerId === "claude" && call.round === 0);
+  assert.ok(notionCall);
+  assert.match(notionCall.prompt, /Write all substantive content in Korean \(한국어\)/);
+  assert.match(notionCall.prompt, /Keep the required English top-level section headings exactly as written/);
+
+  const reviewerCall = gateway.calls.find((call) => call.providerId === "gemini" && call.round === 1);
+  assert.ok(reviewerCall);
+  assert.match(reviewerCall.prompt, /Write all substantive content in Korean \(한국어\)/);
+  assert.match(reviewerCall.prompt, /Keep the required English section headings exactly as written/);
+
+  const coordinatorCall = gateway.calls.find((call) => call.providerId === "claude" && call.round === 1);
+  assert.ok(coordinatorCall);
+  assert.match(coordinatorCall.prompt, /Write all substantive content in Korean \(한국어\)/);
+  assert.match(coordinatorCall.prompt, /Keep the required English section headings exactly as written/);
+});
+
 test("orchestrator persists streamed chat messages emitted during provider turns", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));
@@ -611,14 +693,31 @@ test("realtime mode waits for unanimous approval and saves only the final draft 
   await storage.saveProfileTextDocument("Career", "Built product and growth systems", true);
 
   const compiler = new ContextCompiler(storage);
-  const gateway = new FakeGateway(healthyStates(), (providerId, prompt) => {
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt, round) => {
     if (providerId === "claude") {
       return /closing a realtime multi-model essay review session/i.test(prompt)
         ? "최종 지원서 초안"
-        : "핵심 성과 수치를 한 줄로 더 선명하게 맞춰보는 게 어떨까요?";
+        : buildRealtimeLedgerResponse({
+            currentFocus: round === 1 ? "핵심 성과 수치를 먼저 선명하게 정리합니다." : "성과와 회사 연결을 한 문단으로 정리합니다.",
+            targetSection: "도입 문단",
+            miniDraft: round === 1
+              ? "대규모 결제 안정화 경험을 먼저 꺼내고, 왜 그 경험이 컬리와 맞닿는지 바로 잇습니다."
+              : "대규모 결제 안정화 경험을 먼저 꺼내고, 그 경험이 컬리의 사용자 신뢰와 어떻게 연결되는지 한 문단에서 정리합니다.",
+            acceptedDecisions: ["성과 수치를 초반에 배치한다"],
+            openChallenges: round === 1 ? ["컬리와의 연결 근거를 더 분명히 써야 한다"] : []
+          });
     }
 
-    return "좋습니다. 이 방향이면 충분합니다.\nStatus: APPROVE";
+    return [
+      "Mini Draft: 성과를 먼저 꺼내는 방향은 좋습니다.",
+      round === 1
+        ? "Challenge: 컬리와의 연결 근거는 아직 열어둬야 합니다."
+        : "Challenge: 남은 쟁점은 이제 닫아도 됩니다.",
+      round === 1
+        ? "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다."
+        : "Cross-feedback: 직전 라운드 objection에 동의하며 회사 연결 근거를 더 보강했습니다.",
+      "Status: APPROVE"
+    ].join("\n");
   });
 
   const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
@@ -634,15 +733,137 @@ test("realtime mode waits for unanimous approval and saves only the final draft 
   });
 
   assert.equal(result.run.status, "completed");
-  assert.equal(result.run.rounds, 1);
+  assert.equal(result.run.rounds, 2);
   assert.equal(result.artifacts.revisedDraft, "최종 지원서 초안");
   assert.equal((await storage.getPreferences()).lastReviewMode, "realtime");
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "summary.md"), undefined);
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "improvement-plan.md"), undefined);
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "revised-draft.md"), "최종 지원서 초안");
+  const discussionLedger = await storage.readOptionalRunArtifact(project.slug, result.run.id, "discussion-ledger.md");
+  assert.ok(discussionLedger);
+  assert.match(discussionLedger, /## Mini Draft/);
+  assert.match(discussionLedger, /성과와 회사 연결/);
   const reviewerPrompt = gateway.calls.find((call) => call.providerId === "codex");
   assert.ok(reviewerPrompt);
   assert.match(reviewerPrompt.prompt, /Status: APPROVE/);
+});
+
+test("realtime prompts explicitly require Korean responses while preserving status lines", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Kurly");
+  await storage.saveProfileTextDocument("Career", "Built product systems", true);
+
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt) => {
+    if (providerId === "claude") {
+      return /closing a realtime multi-model essay review session/i.test(prompt)
+        ? "최종 지원서 초안"
+        : buildRealtimeLedgerResponse({
+            currentFocus: "핵심 근거를 더 선명하게 맞춥니다.",
+            targetSection: "도입 문단",
+            miniDraft: "핵심 성과와 지원 동기의 연결을 두 문장으로 압축합니다.",
+            acceptedDecisions: ["성과를 먼저 말한다"],
+            openChallenges: []
+          });
+    }
+
+    return ["Mini Draft: 방향은 좋습니다.", "Challenge: 남은 쟁점은 없습니다.", "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.", "Status: APPROVE"].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Kurly?",
+    draft: "사용자 문제 해결이 좋아요.",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["gemini"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const coordinatorPrompt = gateway.calls.find(
+    (call) => call.providerId === "claude" && call.round === 1 && !/closing a realtime multi-model essay review session/i.test(call.prompt)
+  );
+  assert.ok(coordinatorPrompt);
+  assert.match(coordinatorPrompt.prompt, /Write your response sentences in Korean \(한국어\)/);
+  assert.match(coordinatorPrompt.prompt, /Keep any required English status line exactly as written/);
+
+  const reviewerPrompt = gateway.calls.find((call) => call.providerId === "gemini" && call.round === 1);
+  assert.ok(reviewerPrompt);
+  assert.match(reviewerPrompt.prompt, /Write your response sentences in Korean \(한국어\)/);
+  assert.match(reviewerPrompt.prompt, /Keep any required English status line exactly as written/);
+  assert.match(reviewerPrompt.prompt, /Status: APPROVE/);
+  assert.match(reviewerPrompt.prompt, /## Discussion Ledger/);
+  assert.match(reviewerPrompt.prompt, /## Mini Draft/);
+
+  const finalPrompt = gateway.calls.find(
+    (call) => call.providerId === "claude" && /closing a realtime multi-model essay review session/i.test(call.prompt)
+  );
+  assert.ok(finalPrompt);
+  assert.match(finalPrompt.prompt, /Write the final essay draft in Korean \(한국어\)/);
+});
+
+test("realtime reviewer prompts include the latest ledger and previous-round cross-feedback instructions", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Musinsa");
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt, round) => {
+    if (providerId === "claude") {
+      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+        return "무신사 최종본";
+      }
+      return buildRealtimeLedgerResponse({
+        currentFocus: round === 1 ? "브랜드 적합도보다 성과 근거를 먼저 정리합니다." : "성과 근거와 브랜드 적합도를 같이 묶습니다.",
+        targetSection: "지원 동기 문단",
+        miniDraft: round === 1
+          ? "검색 품질 개선 성과를 먼저 제시하고, 왜 그 경험이 무신사와 닿는지 한 문장으로 잇습니다."
+          : "검색 품질 개선 성과를 먼저 제시하고, 그 경험이 무신사의 탐색 경험과 어떻게 이어지는지 두 문장으로 잇습니다.",
+        acceptedDecisions: ["성과를 문단 첫머리에 둔다"],
+        openChallenges: round === 1 ? ["무신사와의 연결 근거가 아직 약하다"] : []
+      });
+    }
+
+    return [
+      round === 1
+        ? "Mini Draft: 성과를 먼저 두는 방향은 좋습니다."
+        : "Mini Draft: 무신사와의 연결 문장을 더 선명하게 유지하세요.",
+      round === 1
+        ? "Challenge: 무신사와의 연결 근거는 열어둬야 합니다."
+        : "Challenge: 남은 쟁점은 이제 닫아도 됩니다.",
+      round === 1
+        ? "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다."
+        : "Cross-feedback: 직전 라운드 objection에 동의하며 회사 연결 근거를 더 보강해야 합니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Musinsa?",
+    draft: "패션 플랫폼이 좋아서 지원합니다.",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "gemini"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const roundTwoReviewerPrompt = gateway.calls.find((call) => call.providerId === "codex" && call.round === 2);
+  assert.ok(roundTwoReviewerPrompt);
+  assert.match(roundTwoReviewerPrompt.prompt, /## Discussion Ledger/);
+  assert.match(roundTwoReviewerPrompt.prompt, /## Previous Round Reviewer Summary/);
+  assert.match(roundTwoReviewerPrompt.prompt, /## Mini Draft/);
+  assert.match(roundTwoReviewerPrompt.prompt, /성과를 문단 첫머리에 둔다/);
+  assert.match(roundTwoReviewerPrompt.prompt, /무신사와의 연결 근거가 아직 약하다/);
+  assert.match(roundTwoReviewerPrompt.prompt, /explicitly agree or disagree with exactly one objection/i);
 });
 
 test("realtime mode tracks duplicate reviewer slots separately", async (t) => {
@@ -656,14 +877,25 @@ test("realtime mode tracks duplicate reviewer slots separately", async (t) => {
     if (options?.speakerRole === "coordinator") {
       return /closing a realtime multi-model essay review session/i.test(prompt)
         ? "중복 reviewer 최종본"
-        : "협업 경험을 더 또렷하게 맞추죠.";
+        : buildRealtimeLedgerResponse({
+            currentFocus: "협업 경험을 더 또렷하게 맞춥니다.",
+            targetSection: "협업 문단",
+            miniDraft: "협업 장면을 먼저 보여주고, 그 결과를 숫자로 닫습니다.",
+            acceptedDecisions: ["협업 장면을 구체화한다"],
+            openChallenges: round === 1 ? ["결과 수치가 아직 약하다"] : []
+          });
     }
 
     if (round === 1 && options?.participantId === "reviewer-1") {
-      return "아직 근거가 약합니다.\nStatus: REVISE";
+      return ["Mini Draft: 협업 장면은 좋지만 결과 수치는 약합니다.", "Challenge: 결과 수치는 아직 열어둬야 합니다.", "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.", "Status: REVISE"].join("\n");
     }
 
-    return `좋습니다. ${options?.participantLabel || "reviewer"} 기준으로 충분합니다.\nStatus: APPROVE`;
+    return [
+      `Mini Draft: ${options?.participantLabel || "reviewer"} 기준으로 방향은 충분합니다.`,
+      round === 1 ? "Challenge: 결과 수치는 더 보강해야 합니다." : "Challenge: 남은 쟁점은 없습니다.",
+      round === 1 ? "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다." : "Cross-feedback: 직전 objection을 반영해 수치 보강에 동의합니다.",
+      "Status: APPROVE"
+    ].join("\n");
   });
 
   const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
@@ -707,12 +939,18 @@ test("realtime mode pauses after four rounds without consensus and can stop with
   const storage = await createStorage(workspaceRoot);
   const project = await storage.createProject("Woowa");
   const compiler = new ContextCompiler(storage);
-  const gateway = new FakeGateway(healthyStates(), (providerId) => {
+  const gateway = new FakeGateway(healthyStates(), (providerId, _prompt, round) => {
     if (providerId === "claude") {
-      return "이 문단의 근거가 아직 약하니 한 번만 더 짚어볼게요.";
+      return buildRealtimeLedgerResponse({
+        currentFocus: "이 문단의 근거를 더 보강합니다.",
+        targetSection: "지원 동기 문단",
+        miniDraft: "서비스 친숙함만 말하지 말고, 직접 만든 개선 경험과 연결합니다.",
+        acceptedDecisions: ["서비스 친숙함만으로는 부족하다"],
+        openChallenges: [`라운드 ${round}에서도 근거가 여전히 약하다`]
+      });
     }
 
-    return "아직 구체성이 부족합니다.\nStatus: REVISE";
+    return ["Mini Draft: 아직 구체성이 부족합니다.", "Challenge: 쟁점을 유지해야 합니다.", "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.", "Status: REVISE"].join("\n");
   });
 
   const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
@@ -739,6 +977,9 @@ test("realtime mode pauses after four rounds without consensus and can stop with
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "summary.md"), undefined);
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "improvement-plan.md"), undefined);
   assert.equal(await storage.readOptionalRunArtifact(project.slug, result.run.id, "revised-draft.md"), undefined);
+  const ledgerArtifact = await storage.readOptionalRunArtifact(project.slug, result.run.id, "discussion-ledger.md");
+  assert.ok(ledgerArtifact);
+  assert.match(ledgerArtifact, /## Open Challenges/);
   assert.ok(events.some((event) => event.type === "awaiting-user-input" && /without unanimous approval/i.test(event.message ?? "")));
   assert.ok(events.some((event) => event.type === "user-input-received" && /without a final draft/i.test(event.message ?? "")));
   assert.equal(
@@ -759,20 +1000,32 @@ test("realtime mode lets the current writer finish, then redirects through the c
   const gateway = new FakeGateway(healthyStates(), (providerId, prompt, round) => {
     if (providerId === "claude") {
       if (/The user just redirected the discussion/i.test(prompt)) {
-        return "좋아요. 이제 협업 경험을 중심으로 다시 맞춰봅시다.";
+        return buildRealtimeLedgerResponse({
+          currentFocus: "사용자 요청대로 협업 경험 중심으로 방향을 전환합니다.",
+          targetSection: "협업 문단",
+          miniDraft: "혼자 해결했다는 표현을 줄이고, 협업으로 문제를 푼 장면을 전면에 둡니다.",
+          acceptedDecisions: ["협업 경험을 전면에 둔다"],
+          openChallenges: []
+        });
       }
       if (/closing a realtime multi-model essay review session/i.test(prompt)) {
         return "협업 중심 최종본";
       }
-      return "우선 핵심 임팩트를 더 선명하게 보죠.";
+      return buildRealtimeLedgerResponse({
+        currentFocus: "우선 핵심 임팩트를 선명하게 잡습니다.",
+        targetSection: "도입 문단",
+        miniDraft: "모빌리티 서비스 경험보다 직접 만든 임팩트를 먼저 말합니다.",
+        acceptedDecisions: ["임팩트를 먼저 제시한다"],
+        openChallenges: ["협업 장면이 아직 드러나지 않는다"]
+      });
     }
 
     if (providerId === "codex" && round === 1) {
       queuedMessages.push("방금 논점 말고 협업이 드러나게 바꿔줘");
-      return "이 방향은 아직 애매합니다.\nStatus: REVISE";
+      return ["Mini Draft: 이 방향은 아직 애매합니다.", "Challenge: 협업 장면은 열어둬야 합니다.", "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.", "Status: REVISE"].join("\n");
     }
 
-    return "이제 충분합니다.\nStatus: APPROVE";
+    return ["Mini Draft: 이제 충분합니다.", "Challenge: 남은 쟁점은 없습니다.", "Cross-feedback: 직전 objection에 동의하며 협업 장면을 보강했습니다.", "Status: APPROVE"].join("\n");
   });
 
   const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);

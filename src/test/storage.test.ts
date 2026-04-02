@@ -121,3 +121,24 @@ test("storage persists the last selected review mode preference", async (t) => {
   const preferences = await storage.getPreferences();
   assert.equal(preferences.lastReviewMode, "realtime");
 });
+
+test("storage loads profile document preview from normalized content before raw fallback", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const textDocument = await storage.saveProfileTextDocument("Career Summary", "raw summary", true, "핵심");
+  const refreshedTextDocument = await storage.getProfileDocument(textDocument.id);
+  const normalizedPreview = await storage.readDocumentPreviewContent(refreshedTextDocument);
+
+  assert.equal(normalizedPreview.previewSource, "normalized");
+  assert.equal(normalizedPreview.content, "raw summary");
+
+  const imageFile = await writePngPlaceholder(workspaceRoot);
+  const imageDocument = await storage.importProfileFile(imageFile, false, "screenshot");
+  const refreshedImageDocument = await storage.getProfileDocument(imageDocument.id);
+  const missingPreview = await storage.readDocumentPreviewContent(refreshedImageDocument);
+
+  assert.equal(missingPreview.previewSource, "none");
+  assert.equal(missingPreview.content, "");
+});

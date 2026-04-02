@@ -1,13 +1,21 @@
 const stateSource = String.raw`
       const vscode = acquireVsCodeApi();
       const restored = vscode.getState() || {};
+      const defaultCollapsibleStates = Object.freeze({
+        runSetup: true,
+        projectCreate: false,
+        projectRubric: true,
+        projectContext: true
+      });
       let appState = null;
       let selectedTab = restored.selectedTab || "providers";
       let selectedProjectSlug = restored.selectedProjectSlug || null;
       let runLog = restored.runLog || [];
       let runChatMessages = restored.runChatMessages || [];
+      let liveDiscussionLedger = restored.liveDiscussionLedger || null;
       let runContinuation = restored.runContinuation || null;
       let projectDocumentEditor = restored.projectDocumentEditor || null;
+      let profileDocumentPreview = null;
       let awaitingIntervention = restored.awaitingIntervention || null;
       let providerModelSelections = restored.providerModelSelections || {};
       let providerCustomModels = restored.providerCustomModels || {};
@@ -15,8 +23,8 @@ const stateSource = String.raw`
       let runCoordinatorSelection = restored.runCoordinatorSelection || null;
       let runReviewerSelections = Array.isArray(restored.runReviewerSelections) ? restored.runReviewerSelections : [];
       let runFormState = restored.runFormState || null;
-      let runSetupCollapsed = Boolean(restored.runSetupCollapsed);
-      let projectCreateExpanded = Boolean(restored.projectCreateExpanded);
+      let collapsibleStates = normalizeCollapsibleStates(restored.collapsibleStates, restored);
+      let tabScrollPositions = restored.tabScrollPositions || {};
       let bannerQueue = restored.bannerQueue || [];
       let activeTurnStates = restored.activeTurnStates || {};
       const pendingChatChunks = new Map();
@@ -24,6 +32,7 @@ const stateSource = String.raw`
       const pendingFeedbackElements = new Set();
       let chatPumpHandle = null;
       let bannerDrainHandle = null;
+      let scrollRestoreHandle = null;
       const customModelOptionValue = "__custom__";
 
       const tabLabels = {
@@ -48,6 +57,72 @@ const stateSource = String.raw`
 
       function normalizeReviewMode(value) {
         return value === "realtime" ? "realtime" : defaultReviewModeValue;
+      }
+
+      function normalizeCollapsibleStates(raw, legacyState) {
+        const next = { ...defaultCollapsibleStates };
+        if (legacyState && typeof legacyState === "object") {
+          if (typeof legacyState.runSetupCollapsed === "boolean") {
+            next.runSetup = !legacyState.runSetupCollapsed;
+          }
+          if (typeof legacyState.projectCreateExpanded === "boolean") {
+            next.projectCreate = legacyState.projectCreateExpanded;
+          }
+        }
+        if (!raw || typeof raw !== "object") {
+          return next;
+        }
+        for (const key of Object.keys(defaultCollapsibleStates)) {
+          if (typeof raw[key] === "boolean") {
+            next[key] = raw[key];
+          }
+        }
+        return next;
+      }
+
+      function isCollapsibleOpen(key) {
+        return collapsibleStates[key] !== false;
+      }
+
+      function setCollapsibleOpen(key, open) {
+        collapsibleStates[key] = Boolean(open);
+      }
+
+      function currentScrollTop() {
+        return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+      }
+
+      function rememberCurrentTabScroll() {
+        if (!selectedTab) {
+          return;
+        }
+        tabScrollPositions[selectedTab] = currentScrollTop();
+      }
+
+      function restoreSelectedTabScroll() {
+        if (!selectedTab) {
+          return;
+        }
+        const target = Math.max(0, Number(tabScrollPositions[selectedTab]) || 0);
+        if (scrollRestoreHandle) {
+          cancelAnimationFrame(scrollRestoreHandle);
+        }
+        scrollRestoreHandle = requestAnimationFrame(() => {
+          scrollRestoreHandle = null;
+          const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+          window.scrollTo(0, Math.min(target, maxScroll));
+        });
+      }
+
+      function switchTab(nextTab) {
+        if (!nextTab || selectedTab === nextTab) {
+          return;
+        }
+        rememberCurrentTabScroll();
+        if (nextTab !== "profile") {
+          profileDocumentPreview = null;
+        }
+        selectedTab = nextTab;
       }
 
       function currentReviewMode() {
@@ -306,6 +381,7 @@ const stateSource = String.raw`
           selectedProjectSlug,
           runLog,
           runChatMessages,
+          liveDiscussionLedger,
           runContinuation,
           projectDocumentEditor,
           awaitingIntervention,
@@ -315,8 +391,8 @@ const stateSource = String.raw`
           runCoordinatorSelection,
           runReviewerSelections,
           runFormState,
-          runSetupCollapsed,
-          projectCreateExpanded,
+          collapsibleStates,
+          tabScrollPositions,
           bannerQueue,
           activeTurnStates
         });
@@ -560,6 +636,9 @@ const messageHandlingSource = String.raw`
           if (runContinuation && runContinuation.projectSlug !== selectedProjectSlug) {
             runContinuation = null;
           }
+          if (appState?.runState?.status === "idle") {
+            liveDiscussionLedger = null;
+          }
           if (projectDocumentEditor && projectDocumentEditor.projectSlug !== selectedProjectSlug) {
             projectDocumentEditor = null;
           }
@@ -580,19 +659,31 @@ const messageHandlingSource = String.raw`
             continuationNote: "",
             selectedDocumentIds: [...(runContinuation?.selectedDocumentIds || [])]
           };
-          runSetupCollapsed = false;
+          setCollapsibleOpen("runSetup", true);
           selectedProjectSlug = runContinuation?.projectSlug || selectedProjectSlug;
-          selectedTab = "runs";
+          switchTab("runs");
           render();
           persistState();
         } else if (message.type === "projectDocumentEditorPreset") {
           projectDocumentEditor = message.payload;
           selectedProjectSlug = projectDocumentEditor?.projectSlug || selectedProjectSlug;
-          selectedTab = "projects";
+          switchTab("projects");
           render();
           persistState();
+        } else if (message.type === "profileDocumentPreview") {
+          profileDocumentPreview = message.payload;
+          selectedTab = "profile";
+          clearPendingFeedback();
+          render();
         } else if (message.type === "runEvent") {
           const payload = message.payload;
+          if (payload.type === "run-started") {
+            liveDiscussionLedger = null;
+          }
+          if (payload.type === "discussion-ledger-updated") {
+            liveDiscussionLedger = payload.discussionLedger || null;
+            renderDiscussionLedgerSummary();
+          }
           updateTurnActivity(payload);
           if (payload.type === "awaiting-user-input") {
             awaitingIntervention = {
@@ -614,6 +705,7 @@ const messageHandlingSource = String.raw`
             renderSystemLog();
           }
           renderActivityRow();
+          renderDiscussionLedgerSummary();
           persistState();
         } else if (message.type === "banner") {
           pushBanner(message.payload);
@@ -840,10 +932,19 @@ const renderSource = String.raw`
         renderBanner();
         renderTabs();
         renderContent();
+        renderProfileDocumentPreviewModal();
         renderChatLog();
+        renderDiscussionLedgerSummary();
         renderActivityRow();
         renderConversationComposer();
         renderSystemLog();
+        restoreSelectedTabScroll();
+      }
+
+      function rerenderView() {
+        rememberCurrentTabScroll();
+        render();
+        persistState();
       }
 
       function renderBanner() {
@@ -921,6 +1022,55 @@ const renderSource = String.raw`
         }
       }
 
+      function renderProfileDocumentPreviewModal() {
+        const el = document.getElementById("modal-root");
+        if (!el) {
+          return;
+        }
+
+        const preview = profileDocumentPreview;
+        if (!preview) {
+          document.body.classList.remove("modal-open");
+          el.innerHTML = "";
+          return;
+        }
+
+        document.body.classList.add("modal-open");
+        const previewSourceLabel = preview.previewSource === "normalized"
+          ? "정규화 텍스트"
+          : preview.previewSource === "raw"
+            ? "원본 텍스트"
+            : "미리보기 없음";
+
+        el.innerHTML = \`
+          <div class="modal-backdrop" data-action="close-profile-document-preview">
+            <section class="modal-dialog profile-preview-modal" role="dialog" aria-modal="true" aria-labelledby="profile-preview-title">
+              <div class="modal-header">
+                <div class="stack" style="gap:4px;">
+                  <strong id="profile-preview-title">\${escapeHtml(preview.title)}</strong>
+                  <div class="muted small">\${escapeHtml(preview.sourceType)} • \${escapeHtml(preview.extractionStatus)} • \${escapeHtml(previewSourceLabel)}</div>
+                </div>
+                <button class="button secondary modal-close-button" type="button" data-action="close-profile-document-preview" aria-label="미리보기 닫기">닫기</button>
+              </div>
+              <div class="modal-body stack">
+                \${preview.note ? \`<div class="card"><strong>메모</strong><div class="small">\${escapeHtml(preview.note)}</div></div>\` : ""}
+                <div class="card stack">
+                  <strong>파일 정보</strong>
+                  <div class="small"><span class="muted">원본:</span> \${escapeHtml(preview.rawPath)}</div>
+                  <div class="small"><span class="muted">정규화:</span> \${escapeHtml(preview.normalizedPath || "없음")}</div>
+                </div>
+                <div class="card stack">
+                  <strong>본문 미리보기</strong>
+                  \${preview.previewSource === "none"
+                    ? '<div class="muted small preview-empty">미리보기 가능한 텍스트가 없습니다.</div>'
+                    : \`<pre class="preview-content">\${escapeHtml(preview.content)}</pre>\`}
+                </div>
+              </div>
+            </section>
+          </div>
+        \`;
+      }
+
       function renderChatLog() {
         const el = document.getElementById("run-chat");
         if (!el) {
@@ -984,6 +1134,50 @@ const renderSource = String.raw`
             </span>
           \`;
         }).join("");
+      }
+
+      function renderDiscussionLedgerSummary() {
+        const el = document.getElementById("discussion-ledger-summary");
+        if (!el) {
+          return;
+        }
+
+        const activeRealtime =
+          appState?.runState?.status !== "idle" &&
+          appState?.runState?.reviewMode === "realtime" &&
+          appState?.runState?.projectSlug === selectedProjectSlug;
+        if (!activeRealtime || !liveDiscussionLedger) {
+          el.innerHTML = "";
+          el.hidden = true;
+          return;
+        }
+
+        const challenges = Array.isArray(liveDiscussionLedger.openChallenges) ? liveDiscussionLedger.openChallenges : [];
+        el.hidden = false;
+        el.innerHTML = \`
+          <div class="discussion-ledger-summary">
+            <div class="row space">
+              <strong>실시간 ledger</strong>
+              <span class="chip">\${escapeHtml(liveDiscussionLedger.targetSection || "대상 구간 없음")}</span>
+            </div>
+            <div class="discussion-ledger-grid">
+              <section class="discussion-ledger-block">
+                <div class="discussion-ledger-label">현재 초점</div>
+                <div class="discussion-ledger-value">\${renderMarkdown(liveDiscussionLedger.currentFocus || "")}</div>
+              </section>
+              <section class="discussion-ledger-block">
+                <div class="discussion-ledger-label">미니 초안</div>
+                <div class="discussion-ledger-value">\${renderMarkdown(liveDiscussionLedger.miniDraft || "")}</div>
+              </section>
+            </div>
+            <section class="discussion-ledger-block">
+              <div class="discussion-ledger-label">남은 쟁점</div>
+              \${challenges.length > 0
+                ? \`<ul class="discussion-ledger-list">\${challenges.map((item) => \`<li>\${escapeHtml(item)}</li>\`).join("")}</ul>\`
+                : '<div class="muted small">남은 쟁점이 없습니다.</div>'}
+            </section>
+          </div>
+        \`;
       }
 
       function renderConversationComposer() {
@@ -1102,6 +1296,32 @@ const renderSource = String.raw`
 `;
 
 const pageRendererSource = String.raw`
+      function renderProjectFold(key, title, body) {
+        const open = isCollapsibleOpen(key);
+        return \`
+          <section class="project-fold collapsible-shell \${open ? "open" : ""}">
+            <button
+              class="project-fold-summary collapsible-toggle"
+              type="button"
+              data-action="toggle-collapsible"
+              data-key="\${key}"
+              aria-expanded="\${open ? "true" : "false"}">
+              <span class="project-fold-title">\${escapeHtml(title)}</span>
+              <span class="project-fold-meta">
+                <span class="project-fold-state project-fold-state-open">열림</span>
+                <span class="project-fold-state project-fold-state-closed">접힘</span>
+                <span class="project-fold-chevron collapsible-chevron" aria-hidden="true">⌄</span>
+              </span>
+            </button>
+            <div class="collapsible-panel">
+              <div class="collapsible-panel-inner">
+                <div class="project-fold-body stack">\${body}</div>
+              </div>
+            </div>
+          </section>
+        \`;
+      }
+
       function providerModelSelectionValue(provider) {
         if (providerModelSelections[provider.providerId] !== undefined) {
           return providerModelSelections[provider.providerId];
@@ -1245,6 +1465,7 @@ const pageRendererSource = String.raw`
       function renderProjects() {
         const project = selectedProject();
         const editor = projectDocumentEditor && projectDocumentEditor.projectSlug === selectedProjectSlug ? projectDocumentEditor : null;
+        const projectCreateOpen = isCollapsibleOpen("projectCreate");
         return \`
           <div class="stack projects-screen">
             <div class="projects-toolbar">
@@ -1259,24 +1480,28 @@ const pageRendererSource = String.raw`
                 </select>
               </label>
               <div class="actions">
-                <button class="button secondary" type="button" data-action="toggle-project-create">\${projectCreateExpanded ? "생성 닫기" : "새 프로젝트"}</button>
+                <button class="button secondary" type="button" data-action="toggle-collapsible" data-key="projectCreate" aria-expanded="\${projectCreateOpen ? "true" : "false"}">\${projectCreateOpen ? "생성 닫기" : "새 프로젝트"}</button>
               </div>
             </div>
 
-            \${projectCreateExpanded ? \`
-              <form id="project-form" class="project-inline-panel">
-                <div class="section-heading">새 프로젝트</div>
-                <div class="grid two">
-                  <label>회사 이름<input name="companyName" type="text" placeholder="g마켓" required /></label>
-                  <label>포지션<input name="roleName" type="text" placeholder="검색 엔진 및 Backend 개발 및 운영" /></label>
+            <div class="project-create-shell collapsible-shell \${projectCreateOpen ? "open" : ""}">
+              <div class="collapsible-panel">
+                <div class="collapsible-panel-inner">
+                  <form id="project-form" class="project-inline-panel">
+                    <div class="section-heading">새 프로젝트</div>
+                    <div class="grid two">
+                      <label>회사 이름<input name="companyName" type="text" placeholder="g마켓" required /></label>
+                      <label>포지션<input name="roleName" type="text" placeholder="검색 엔진 및 Backend 개발 및 운영" /></label>
+                    </div>
+                    <label>주요 업무<textarea name="mainResponsibilities" placeholder="공고의 주요 업무를 붙여넣으세요"></textarea></label>
+                    <label>자격요건<textarea name="qualifications" placeholder="공고의 자격요건을 붙여넣으세요"></textarea></label>
+                    <div class="actions">
+                      <button class="button" type="submit">프로젝트 만들기</button>
+                    </div>
+                  </form>
                 </div>
-                <label>주요 업무<textarea name="mainResponsibilities" placeholder="공고의 주요 업무를 붙여넣으세요"></textarea></label>
-                <label>자격요건<textarea name="qualifications" placeholder="공고의 자격요건을 붙여넣으세요"></textarea></label>
-                <div class="actions">
-                  <button class="button" type="submit">프로젝트 만들기</button>
-                </div>
-              </form>
-            \` : ""}
+              </div>
+            </div>
 
             \${project ? \`
               <div class="project-workspace">
@@ -1301,58 +1526,38 @@ const pageRendererSource = String.raw`
                   </div>
                 </form>
 
-                <details class="project-fold" open>
-                  <summary class="project-fold-summary">
-                    <span class="project-fold-title">평가 기준</span>
-                    <span class="project-fold-meta">
-                      <span class="project-fold-state project-fold-state-open">열림</span>
-                      <span class="project-fold-state project-fold-state-closed">접힘</span>
-                      <span class="project-fold-chevron" aria-hidden="true">⌄</span>
-                    </span>
-                  </summary>
-                  <div class="project-fold-body stack">
-                    <label>평가 기준<textarea id="project-rubric">\${escapeHtml(project.record.rubric)}</textarea></label>
-                    <div class="actions">
-                      <button class="button" data-action="save-project-rubric">저장</button>
-                      <button class="button secondary" type="button" data-action="reset-project-rubric">초기화</button>
+                \${renderProjectFold("projectRubric", "평가 기준", \`
+                  <label>평가 기준<textarea id="project-rubric">\${escapeHtml(project.record.rubric)}</textarea></label>
+                  <div class="actions">
+                    <button class="button" data-action="save-project-rubric">저장</button>
+                    <button class="button secondary" type="button" data-action="reset-project-rubric">초기화</button>
+                  </div>
+                \`)}
+
+                \${renderProjectFold("projectContext", "프로젝트 컨텍스트", \`
+                  <form id="project-text-form" class="project-inline-panel">
+                    <div class="section-heading">\${editor ? "프로젝트 문서 수정" : "프로젝트 텍스트 추가"}</div>
+                    <input name="documentId" type="hidden" value="\${escapeHtml(editor?.documentId || "")}" />
+                    <label>제목<input name="title" type="text" placeholder="회사 노트" value="\${escapeHtml(editor?.title || "")}" required /></label>
+                    \${editor && !editor.contentEditable ? \`
+                      <div class="muted small">이 파일은 \${escapeHtml(editor.sourceType)} 형식으로 가져온 문서입니다. 여기서는 제목, 메모, 기본 포함 여부만 바꿀 수 있고, 내용은 삭제 후 새 파일을 다시 가져와야 바꿀 수 있습니다.</div>
+                    \` : \`
+                      <label>내용<textarea name="content" placeholder="회사별 메모를 붙여넣으세요" required>\${escapeHtml(editor?.content || "")}</textarea></label>
+                    \`}
+                    <label>메모<input name="note" type="text" placeholder="선택 메모" value="\${escapeHtml(editor?.note || "")}" /></label>
+                    <div class="inline-toggle-row">
+                      <span class="muted small">기본 포함된 프로젝트 문서는 모든 실행에 자동으로 들어갑니다.</span>
+                      <label class="toggle-pill"><input name="pinnedByDefault" type="checkbox" \${editor?.pinnedByDefault ? "checked" : ""} /> <span>기본 포함</span></label>
                     </div>
-                  </div>
-                </details>
+                    <div class="actions">
+                      <button class="button" type="submit">저장</button>
+                      \${editor ? '<button class="button secondary" type="button" data-action="clear-project-document-editor">편집 취소</button>' : ""}
+                      <button class="button secondary" type="button" data-action="add-project-files">파일 가져오기</button>
+                    </div>
+                  </form>
 
-                <details class="project-fold" open>
-                  <summary class="project-fold-summary">
-                    <span class="project-fold-title">프로젝트 컨텍스트</span>
-                    <span class="project-fold-meta">
-                      <span class="project-fold-state project-fold-state-open">열림</span>
-                      <span class="project-fold-state project-fold-state-closed">접힘</span>
-                      <span class="project-fold-chevron" aria-hidden="true">⌄</span>
-                    </span>
-                  </summary>
-                  <div class="project-fold-body stack">
-                    <form id="project-text-form" class="project-inline-panel">
-                      <div class="section-heading">\${editor ? "프로젝트 문서 수정" : "프로젝트 텍스트 추가"}</div>
-                      <input name="documentId" type="hidden" value="\${escapeHtml(editor?.documentId || "")}" />
-                      <label>제목<input name="title" type="text" placeholder="회사 노트" value="\${escapeHtml(editor?.title || "")}" required /></label>
-                      \${editor && !editor.contentEditable ? \`
-                        <div class="muted small">이 파일은 \${escapeHtml(editor.sourceType)} 형식으로 가져온 문서입니다. 여기서는 제목, 메모, 기본 포함 여부만 바꿀 수 있고, 내용은 삭제 후 새 파일을 다시 가져와야 바꿀 수 있습니다.</div>
-                      \` : \`
-                        <label>내용<textarea name="content" placeholder="회사별 메모를 붙여넣으세요" required>\${escapeHtml(editor?.content || "")}</textarea></label>
-                      \`}
-                      <label>메모<input name="note" type="text" placeholder="선택 메모" value="\${escapeHtml(editor?.note || "")}" /></label>
-                      <div class="inline-toggle-row">
-                        <span class="muted small">기본 포함된 프로젝트 문서는 모든 실행에 자동으로 들어갑니다.</span>
-                        <label class="toggle-pill"><input name="pinnedByDefault" type="checkbox" \${editor?.pinnedByDefault ? "checked" : ""} /> <span>기본 포함</span></label>
-                      </div>
-                      <div class="actions">
-                        <button class="button" type="submit">저장</button>
-                        \${editor ? '<button class="button secondary" type="button" data-action="clear-project-document-editor">편집 취소</button>' : ""}
-                        <button class="button secondary" type="button" data-action="add-project-files">파일 가져오기</button>
-                      </div>
-                    </form>
-
-                    <div class="doc-list">\${renderProjectDocuments(project.documents)}</div>
-                  </div>
-                </details>
+                  <div class="doc-list">\${renderProjectDocuments(project.documents)}</div>
+                \`)}
               </div>
             \` : '<div class="muted small">프로젝트를 만들거나 위 목록에서 선택하세요.</div>'}
           </div>
@@ -1384,6 +1589,7 @@ const pageRendererSource = String.raw`
         const activeReviewMode = currentReviewMode();
         const continuationDisabledAttr = appState?.busyMessage || appState.runState?.status !== "idle" ? "disabled" : "";
         const healthyProviderIds = new Set(healthyProviders.map((provider) => provider.providerId));
+        const runSetupOpen = isCollapsibleOpen("runSetup");
         const canRunReview =
           appState.runState?.status === "idle" &&
           Boolean(selectedCoordinator) &&
@@ -1406,18 +1612,21 @@ const pageRendererSource = String.raw`
               <div class="muted small">현재 프로젝트: \${escapeHtml(project.record.companyName)}. 코디네이터는 정확히 1명, 리뷰어는 최소 1명 선택해야 합니다. 현재 정상 도구: \${healthyProviders.map((provider) => provider.providerId).join(", ") || "없음"}.</div>
             </div>
 
-            <details id="run-setup-details" class="card run-setup-card" \${runSetupCollapsed ? "" : "open"}>
-              <summary class="run-setup-summary">
+            <section class="card run-setup-card collapsible-shell \${runSetupOpen ? "open" : ""}">
+              <button class="run-setup-summary collapsible-toggle" type="button" data-action="toggle-collapsible" data-key="runSetup" aria-expanded="\${runSetupOpen ? "true" : "false"}">
                 <div class="stack" style="gap:4px;">
                   <strong>실행 설정</strong>
-                  <div class="muted small">\${runSetupCollapsed ? "다음 실행에 쓸 질문, 컨텍스트, 참여자를 펼쳐서 수정하세요." : "다음 실행에 쓸 질문, 컨텍스트, 참여자를 설정하세요."}</div>
+                  <div class="muted small">\${runSetupOpen ? "다음 실행에 쓸 질문, 컨텍스트, 참여자를 설정하세요." : "다음 실행에 쓸 질문, 컨텍스트, 참여자를 펼쳐서 수정하세요."}</div>
                 </div>
-                <div class="row">
+                <div class="row run-setup-summary-meta">
                   <span class="chip">\${escapeHtml(reviewModeLabel(activeReviewMode))}</span>
                   <span class="chip">\${escapeHtml(selectedCoordinator || "코디네이터 없음")}</span>
                   <span class="chip">\${escapeHtml(reviewerCountLabel(selectedReviewers.length))}</span>
+                  <span class="project-fold-chevron collapsible-chevron" aria-hidden="true">⌄</span>
                 </div>
-              </summary>
+              </button>
+              <div class="collapsible-panel">
+              <div class="collapsible-panel-inner">
               <div class="stack run-setup-body">
               \${runContinuation ? \`
                 <div class="card">
@@ -1511,7 +1720,8 @@ const pageRendererSource = String.raw`
               </div>
             </div>
             </div>
-            </details>
+            </div>
+            </section>
 
             <div class="card conversation-card">
               <div class="row space">
@@ -1532,6 +1742,7 @@ const pageRendererSource = String.raw`
                 \${conversationChip("개입: 자동 일시정지")}
                 \${conversationChip("마크다운: 완료")}
               </div>
+              <div id="discussion-ledger-summary" class="discussion-ledger-summary-host" hidden></div>
               <div id="run-activity" class="activity-row"></div>
               <div id="run-chat" class="chat-log"></div>
               <div id="run-composer" class="conversation-composer-host"></div>
@@ -1570,6 +1781,7 @@ const pageRendererSource = String.raw`
                       \${run.artifacts.summary ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="summary.md">요약 열기</button>\` : ""}
                       \${run.artifacts.improvementPlan ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="improvement-plan.md">개선안 열기</button>\` : ""}
                       \${run.artifacts.revisedDraft ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="revised-draft.md">\${escapeHtml(revisedDraftButtonLabel(run.record))}</button>\` : ""}
+                      \${run.artifacts.discussionLedger ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="discussion-ledger.md">토론 상태 열기</button>\` : ""}
                       \${run.artifacts.notionBrief ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="notion-brief.md">노션 브리프 열기</button>\` : ""}
                       \${run.artifacts.chatMessages ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="chat-messages.json">채팅 메시지 열기</button>\` : ""}
                       \${run.artifacts.events ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="events.ndjson">이벤트 열기</button>\` : ""}
@@ -1588,25 +1800,51 @@ const pageRendererSource = String.raw`
         }
 
         return documents.map((document) => \`
-          <div class="doc-item">
-            <div class="row space">
-              <div>
-                <strong>\${escapeHtml(document.title)}</strong>
-                <div class="muted small">\${escapeHtml(document.sourceType)} • \${escapeHtml(document.extractionStatus)}</div>
+          <div class="doc-item \${scope === "profile" ? "profile-doc-item" : ""}">
+            \${scope === "profile" ? \`
+              <div class="row space doc-item-header">
+                <button class="doc-preview-trigger" type="button" data-action="open-profile-document-preview" data-document-id="\${document.id}">
+                  <div class="doc-preview-header">
+                    <div>
+                      <strong>\${escapeHtml(document.title)}</strong>
+                      <div class="muted small">\${escapeHtml(document.sourceType)} • \${escapeHtml(document.extractionStatus)}</div>
+                    </div>
+                    <span class="doc-preview-hint">세부 내용 보기</span>
+                  </div>
+                  \${document.note ? \`<div class="small">\${escapeHtml(document.note)}</div>\` : ""}
+                  <div class="muted small">\${escapeHtml(document.rawPath)}</div>
+                </button>
+                <label class="pin-toggle" title="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}">
+                  <input
+                    type="checkbox"
+                    aria-label="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}"
+                    data-action="toggle-profile-pinned"
+                    data-document-id="\${document.id}"
+                    \${document.pinnedByDefault ? "checked" : ""}
+                  />
+                  <span class="pin-icon" aria-hidden="true"></span>
+                </label>
               </div>
-              <label class="pin-toggle" title="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}">
-                <input
-                  type="checkbox"
-                  aria-label="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}"
-                  data-action="\${scope === "profile" ? "toggle-profile-pinned" : "toggle-project-pinned"}"
-                  data-document-id="\${document.id}"
-                  \${document.pinnedByDefault ? "checked" : ""}
-                />
-                <span class="pin-icon" aria-hidden="true"></span>
-              </label>
-            </div>
-            \${document.note ? \`<div class="small">\${escapeHtml(document.note)}</div>\` : ""}
-            <div class="muted small">\${escapeHtml(document.rawPath)}</div>
+            \` : \`
+              <div class="row space">
+                <div>
+                  <strong>\${escapeHtml(document.title)}</strong>
+                  <div class="muted small">\${escapeHtml(document.sourceType)} • \${escapeHtml(document.extractionStatus)}</div>
+                </div>
+                <label class="pin-toggle" title="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}">
+                  <input
+                    type="checkbox"
+                    aria-label="\${document.pinnedByDefault ? "기본 포함됨" : "기본 포함"}"
+                    data-action="toggle-project-pinned"
+                    data-document-id="\${document.id}"
+                    \${document.pinnedByDefault ? "checked" : ""}
+                  />
+                  <span class="pin-icon" aria-hidden="true"></span>
+                </label>
+              </div>
+              \${document.note ? \`<div class="small">\${escapeHtml(document.note)}</div>\` : ""}
+              <div class="muted small">\${escapeHtml(document.rawPath)}</div>
+            \`}
           </div>
         \`).join("");
       }
@@ -1646,6 +1884,10 @@ const pageRendererSource = String.raw`
 `;
 
 const domEventSource = String.raw`
+      window.addEventListener("scroll", () => {
+        rememberCurrentTabScroll();
+      }, { passive: true });
+
       document.addEventListener("click", (event) => {
         const target = event.target.closest("[data-action]");
         if (!target) {
@@ -1654,7 +1896,18 @@ const domEventSource = String.raw`
 
         const action = target.dataset.action;
         if (action === "switch-tab") {
-          selectedTab = target.dataset.tab;
+          switchTab(target.dataset.tab);
+          render();
+          persistState();
+          return;
+        }
+        if (action === "toggle-collapsible") {
+          const key = target.dataset.key;
+          if (!key || !(key in defaultCollapsibleStates)) {
+            return;
+          }
+          rememberCurrentTabScroll();
+          setCollapsibleOpen(key, !isCollapsibleOpen(key));
           render();
           persistState();
           return;
@@ -1700,6 +1953,16 @@ const domEventSource = String.raw`
           post({ type: "setProviderModel", providerId, model });
           return;
         }
+        if (action === "open-profile-document-preview") {
+          markPending(target);
+          post({ type: "openProfileDocumentPreview", documentId: target.dataset.documentId });
+          return;
+        }
+        if (action === "close-profile-document-preview") {
+          profileDocumentPreview = null;
+          renderProfileDocumentPreviewModal();
+          return;
+        }
         if (action === "clear-api-key") {
           markPending(target);
           post({ type: "clearApiKey", providerId: target.dataset.provider });
@@ -1723,19 +1986,12 @@ const domEventSource = String.raw`
           if (projectDocumentEditor && projectDocumentEditor.projectSlug !== selectedProjectSlug) {
             projectDocumentEditor = null;
           }
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "delete-project") {
           markPending(target);
           post({ type: "deleteProject", projectSlug: selectedProjectSlug });
-          return;
-        }
-        if (action === "toggle-project-create") {
-          projectCreateExpanded = !projectCreateExpanded;
-          render();
-          persistState();
           return;
         }
         if (action === "save-project-rubric") {
@@ -1770,15 +2026,13 @@ const domEventSource = String.raw`
           });
           if (projectDocumentEditor?.documentId === target.dataset.documentId) {
             projectDocumentEditor = null;
-            render();
-            persistState();
+            rerenderView();
           }
           return;
         }
         if (action === "clear-project-document-editor") {
           projectDocumentEditor = null;
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "run-review") {
@@ -1792,8 +2046,7 @@ const domEventSource = String.raw`
             return;
           }
           runReviewerSelections = [...runReviewerSelections, fallbackProvider];
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "remove-reviewer-row") {
@@ -1802,8 +2055,7 @@ const domEventSource = String.raw`
             return;
           }
           runReviewerSelections = runReviewerSelections.filter((_, itemIndex) => itemIndex !== index);
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "toggle-run-extra-doc") {
@@ -1827,8 +2079,7 @@ const domEventSource = String.raw`
             current.add(documentId);
           }
           runFormState.selectedDocumentIds = [...current];
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "load-run-continuation") {
@@ -1845,15 +2096,13 @@ const domEventSource = String.raw`
         }
         if (action === "clear-run-continuation") {
           runContinuation = null;
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "reset-run-form") {
           resetRunFormState();
-          runSetupCollapsed = false;
-          render();
-          persistState();
+          setCollapsibleOpen("runSetup", true);
+          rerenderView();
           return;
         }
         if (action === "open-artifact") {
@@ -1896,8 +2145,7 @@ const domEventSource = String.raw`
           const providerId = target.dataset.provider;
           providerModelSelections[providerId] = target.value;
           if (target.value === customModelOptionValue) {
-            render();
-            persistState();
+            rerenderView();
             return;
           }
           providerCustomModels[providerId] = "";
@@ -1911,14 +2159,12 @@ const domEventSource = String.raw`
         }
         if (action === "set-review-mode") {
           selectedReviewMode = normalizeReviewMode(target.value);
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "set-run-coordinator") {
           runCoordinatorSelection = target.value || null;
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "set-run-reviewer") {
@@ -1927,8 +2173,7 @@ const domEventSource = String.raw`
             return;
           }
           runReviewerSelections[index] = target.value;
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "set-selected-project") {
@@ -1939,8 +2184,7 @@ const domEventSource = String.raw`
           if (projectDocumentEditor && projectDocumentEditor.projectSlug !== selectedProjectSlug) {
             projectDocumentEditor = null;
           }
-          render();
-          persistState();
+          rerenderView();
           return;
         }
         if (action === "toggle-profile-pinned") {
@@ -1991,17 +2235,14 @@ const domEventSource = String.raw`
         }
       });
 
-      document.addEventListener("toggle", (event) => {
-        const target = event.target;
-        if (!(target instanceof HTMLDetailsElement) || target.id !== "run-setup-details") {
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && profileDocumentPreview) {
+          profileDocumentPreview = null;
+          renderProfileDocumentPreviewModal();
+          event.preventDefault();
           return;
         }
 
-        runSetupCollapsed = !target.open;
-        persistState();
-      });
-
-      document.addEventListener("keydown", (event) => {
         const target = event.target;
         if (!(target instanceof HTMLTextAreaElement) || !["round-intervention-input", "completed-run-message"].includes(target.id)) {
           return;
@@ -2045,7 +2286,7 @@ const domEventSource = String.raw`
             qualifications: data.get("qualifications")?.toString() || ""
           });
           form.reset();
-          projectCreateExpanded = false;
+          setCollapsibleOpen("projectCreate", false);
           persistState();
         }
 
@@ -2088,8 +2329,7 @@ const domEventSource = String.raw`
             });
           }
           form.reset();
-          render();
-          persistState();
+          rerenderView();
         }
 
         if (form.id === "round-intervention-form") {
@@ -2146,9 +2386,10 @@ const domEventSource = String.raw`
           return;
         }
 
+        rememberCurrentTabScroll();
         runCoordinatorSelection = coordinatorProvider;
         runReviewerSelections = reviewerProviders;
-        runSetupCollapsed = true;
+        setCollapsibleOpen("runSetup", false);
 
         runLog = [];
         runChatMessages = [];

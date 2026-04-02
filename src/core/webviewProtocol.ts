@@ -36,6 +36,20 @@ export const ProjectDocumentEditorPresetSchema = z.object({
 
 export type ProjectDocumentEditorPreset = z.infer<typeof ProjectDocumentEditorPresetSchema>;
 
+export const ProfileDocumentPreviewPayloadSchema = z.object({
+  documentId: z.string().min(1),
+  title: z.string(),
+  note: z.string(),
+  sourceType: z.string().min(1),
+  extractionStatus: z.string().min(1),
+  rawPath: z.string().min(1),
+  normalizedPath: z.string(),
+  previewSource: z.enum(["normalized", "raw", "none"]),
+  content: z.string()
+});
+
+export type ProfileDocumentPreviewPayload = z.infer<typeof ProfileDocumentPreviewPayloadSchema>;
+
 export const BannerPayloadSchema = z.object({
   kind: z.enum(["info", "error"]).default("info"),
   message: z.string().min(1)
@@ -120,6 +134,10 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     pinned: z.boolean()
   }),
   z.object({
+    type: z.literal("openProfileDocumentPreview"),
+    documentId: z.string().min(1)
+  }),
+  z.object({
     type: z.literal("toggleProjectPinned"),
     projectSlug: z.string().min(1),
     documentId: z.string().min(1),
@@ -137,7 +155,8 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     coordinatorProvider: ProviderIdSchema,
     reviewerProviders: z.array(ProviderIdSchema),
     rounds: z.number().int().min(1),
-    selectedDocumentIds: z.array(z.string())
+    selectedDocumentIds: z.array(z.string()),
+    charLimit: z.number().int().min(1).optional()
   }),
   z.object({
     type: z.literal("submitRoundIntervention"),
@@ -171,6 +190,7 @@ export const ExtensionToWebviewMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("runEvent"), payload: RunEventSchema }),
   z.object({ type: z.literal("banner"), payload: BannerPayloadSchema }),
   z.object({ type: z.literal("projectDocumentEditorPreset"), payload: ProjectDocumentEditorPresetSchema }),
+  z.object({ type: z.literal("profileDocumentPreview"), payload: ProfileDocumentPreviewPayloadSchema }),
   z.object({ type: z.literal("runState"), payload: RunSessionStateSchema })
 ]);
 

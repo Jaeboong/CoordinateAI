@@ -1,6 +1,9 @@
 export const providerIds = ["codex", "claude", "gemini"] as const;
 export type ProviderId = (typeof providerIds)[number];
 
+export const reviewerPerspectives = ["technical", "interviewer", "authenticity"] as const;
+export type ReviewerPerspective = (typeof reviewerPerspectives)[number];
+
 export const authModes = ["cli", "apiKey"] as const;
 export type AuthMode = (typeof authModes)[number];
 
@@ -68,6 +71,8 @@ export interface ProjectRecord {
   qualifications?: string;
   rubric: string;
   pinnedDocumentIds: string[];
+  charLimit?: number;
+  notionPageIds?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -110,6 +115,15 @@ export interface ReviewTurn {
   error?: string;
 }
 
+export interface DiscussionLedger {
+  currentFocus: string;
+  miniDraft: string;
+  acceptedDecisions: string[];
+  openChallenges: string[];
+  targetSection: string;
+  updatedAtRound: number;
+}
+
 export interface RunEvent {
   timestamp: string;
   type:
@@ -125,6 +139,7 @@ export interface RunEvent {
     | "user-input-received"
     | "turn-completed"
     | "turn-failed"
+    | "discussion-ledger-updated"
     | "run-completed"
     | "run-failed";
   providerId?: ProviderId;
@@ -135,6 +150,7 @@ export interface RunEvent {
   speakerRole?: ReviewTurn["role"] | "system" | "user";
   recipient?: string;
   message?: string;
+  discussionLedger?: DiscussionLedger;
 }
 
 export interface RunChatMessage {
@@ -200,4 +216,5 @@ export interface RunRequest {
   reviewerProviders: ProviderId[];
   rounds: number;
   selectedDocumentIds: string[];
+  charLimit?: number;
 }
