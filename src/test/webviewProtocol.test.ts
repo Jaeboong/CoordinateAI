@@ -1,5 +1,6 @@
 import * as assert from "node:assert/strict";
 import test from "node:test";
+import { DiscussionLedgerSchema } from "../core/schemas";
 import { ExtensionToWebviewMessageSchema, WebviewToExtensionMessageSchema } from "../core/webviewProtocol";
 
 test("webview message schema rejects invalid payloads", () => {
@@ -92,6 +93,36 @@ test("extension message schema accepts discussion ledger events and artifact fla
         openChallenges: ["회사 적합도 근거가 아직 약하다"],
         deferredChallenges: ["마지막 포부 문단을 더 구체화한다"],
         targetSection: "지원 동기 1문단",
+        targetSectionKey: "supporting-motivation",
+        sectionOutcome: "handoff-next-section",
+        tickets: [
+          {
+            id: "ticket-1",
+            text: "회사 적합도 근거를 더 구체화한다",
+            sectionKey: "supporting-motivation",
+            sectionLabel: "지원 동기 1문단",
+            severity: "blocking",
+            status: "open",
+            source: "coordinator",
+            introducedAtRound: 2,
+            lastUpdatedAtRound: 2,
+            handoffPriority: 10,
+            evidenceNeeded: "회사와의 연결 근거"
+          },
+          {
+            id: "ticket-2",
+            text: "마지막 포부 문단을 더 구체화한다",
+            sectionKey: "future-impact",
+            sectionLabel: "마지막 포부 문단",
+            severity: "advisory",
+            status: "deferred",
+            source: "reviewer",
+            introducedAtRound: 2,
+            lastUpdatedAtRound: 2,
+            handoffPriority: 3,
+            closeCondition: "후속 문단에서 재검토"
+          }
+        ],
         updatedAtRound: 2
       }
     }
@@ -100,6 +131,39 @@ test("extension message schema accepts discussion ledger events and artifact fla
   assert.equal(ledgerEvent.type, "runEvent");
   assert.equal(ledgerEvent.payload.type, "discussion-ledger-updated");
   assert.equal(ledgerEvent.payload.discussionLedger?.targetSection, "지원 동기 1문단");
+
+  const legacyLedger = DiscussionLedgerSchema.parse({
+    currentFocus: "현재 초점",
+    miniDraft: "미니 초안",
+    acceptedDecisions: ["합의"],
+    openChallenges: ["보강 필요"],
+    deferredChallenges: ["후속 과제"],
+    targetSection: "지원 동기 1문단",
+    updatedAtRound: 2
+  });
+  assert.equal(legacyLedger.tickets, undefined);
+
+  const ticketLedger = DiscussionLedgerSchema.parse({
+    ...legacyLedger,
+    targetSectionKey: "supporting-motivation",
+    sectionOutcome: "handoff-next-section",
+    tickets: [
+      {
+        id: "ticket-1",
+        text: "회사 적합도 근거를 더 구체화한다",
+        sectionKey: "supporting-motivation",
+        sectionLabel: "지원 동기 1문단",
+        severity: "blocking",
+        status: "open",
+        source: "coordinator",
+        introducedAtRound: 2,
+        lastUpdatedAtRound: 2,
+        handoffPriority: 10
+      }
+    ]
+  });
+  assert.equal(ticketLedger.sectionOutcome, "handoff-next-section");
+  assert.equal(ticketLedger.tickets?.[0]?.id, "ticket-1");
 
   const stateMessage = ExtensionToWebviewMessageSchema.parse({
     type: "state",

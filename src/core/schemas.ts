@@ -39,6 +39,24 @@ export const ExtractionStatusSchema = z.enum(extractionStatuses);
 export const RunStatusSchema = z.enum(runStatuses);
 export const ReviewModeSchema = z.enum(reviewModes);
 export const CompileContextProfileSchema = z.enum(compileContextProfiles);
+export const ChallengeSeveritySchema = z.enum(["blocking", "advisory"] as const);
+export const ChallengeStatusSchema = z.enum(["open", "deferred", "closed"] as const);
+export const ChallengeSourceSchema = z.enum(["coordinator", "reviewer", "user", "system"] as const);
+export const SectionOutcomeSchema = z.enum(["keep-open", "close-section", "handoff-next-section", "write-final"] as const);
+export const ChallengeTicketSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  sectionKey: z.string(),
+  sectionLabel: z.string(),
+  severity: ChallengeSeveritySchema,
+  status: ChallengeStatusSchema,
+  source: ChallengeSourceSchema,
+  introducedAtRound: z.number().int().min(0),
+  lastUpdatedAtRound: z.number().int().min(0),
+  handoffPriority: z.number().int(),
+  evidenceNeeded: z.string().optional(),
+  closeCondition: z.string().optional()
+});
 export const DiscussionLedgerSchema = z.object({
   currentFocus: z.string(),
   miniDraft: z.string(),
@@ -46,6 +64,9 @@ export const DiscussionLedgerSchema = z.object({
   openChallenges: z.array(z.string()),
   deferredChallenges: z.array(z.string()),
   targetSection: z.string(),
+  targetSectionKey: z.string().optional(),
+  tickets: z.array(ChallengeTicketSchema).optional(),
+  sectionOutcome: SectionOutcomeSchema.optional(),
   updatedAtRound: z.number().int().min(0)
 });
 export const PromptMetricsSchema = z.object({

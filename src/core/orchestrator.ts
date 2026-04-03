@@ -1,6 +1,10 @@
 import { ContextCompiler } from "./contextCompiler";
 import { ForJobStorage, RunContinuationContext } from "./storage";
 import {
+  ChallengeSeverity,
+  ChallengeSource,
+  ChallengeStatus,
+  ChallengeTicket,
   CompileContextProfile,
   DiscussionLedger,
   ProviderId,
@@ -13,7 +17,8 @@ import {
   RunArtifacts,
   RunEvent,
   RunRequest,
-  RunRecord
+  RunRecord,
+  SectionOutcome
 } from "./types";
 import { createId, nowIso } from "./utils";
 
@@ -74,6 +79,32 @@ interface RealtimeReferencePacket {
   refId: string;
   sourceLabel: string;
   summary: string;
+}
+
+interface ParsedChallengeDecision {
+  ticketId: string;
+  action: "close" | "keep-open" | "defer" | "promote";
+}
+
+interface ParsedChallengeAddDecision {
+  ticketId: "new";
+  action: "add";
+  sectionKey?: string;
+  sectionLabel?: string;
+  severity?: ChallengeSeverity;
+  text?: string;
+}
+
+interface ParsedReviewerChallengeVerdict {
+  ticketId: string;
+  action: "close" | "keep-open" | "defer";
+  reason: string;
+}
+
+interface ChallengeTicketCluster {
+  sectionKey: string;
+  sectionLabel: string;
+  tickets: ChallengeTicket[];
 }
 
 export class ReviewOrchestrator {
@@ -171,6 +202,7 @@ export class ReviewOrchestrator {
     let notionBriefFull = "";
     const userInterventions: Array<{ round: number; text: string }> = [];
     let discussionLedger: DiscussionLedger | undefined;
+    const polishRoundsUsed = new Set<string>();
 
     try {
       const coordinatorState = stateMap.get(coordinator.providerId);
@@ -700,6 +732,13 @@ export class ReviewOrchestrator {
           const allReviewersApprove = hasAllApprovingRealtimeReviewers(activeReviewers, reviewerStatuses);
           const currentSectionReady = isCurrentSectionReady(discussionLedger, activeReviewers, reviewerStatuses);
           const wholeDocumentReady = isWholeDocumentReady(discussionLedger, activeReviewers, reviewerStatuses);
+          const nextCluster = pickNextTargetSectionCluster(discussionLedger);
+          const effectiveSectionOutcome = validateSectionOutcome(discussionLedger?.sectionOutcome, {
+            currentSectionReady,
+            wholeDocumentReady,
+            hasNextCluster: Boolean(nextCluster)
+          });
+          const currentSectionKey = getLedgerTargetSectionKey(discussionLedger);
           if (allReviewersApprove && round < MIN_ROUNDS_BEFORE_CONSENSUS) {
             // 너무 이른 합의 — devil's advocate 발동
             const challengePrompt = buildDevilsAdvocatePrompt(
@@ -729,7 +768,40 @@ export class ReviewOrchestrator {
             continue;
           }
 
-          if (wholeDocumentReady) {
+          if (
+            discussionLedger &&
+            currentSectionReady &&
+            shouldRunWeakConsensusPolish(activeReviewers, reviewerStatuses, currentSectionKey, polishRoundsUsed)
+          ) {
+            polishRoundsUsed.add(currentSectionKey);
+            const polishPrompt = buildWeakConsensusPolishPrompt(
+              compiledContextMarkdown,
+              getNotionBriefForProfile("compact"),
+              userInterventions,
+              turns.filter((turn) => turn.status === "completed"),
+              round,
+              discussionLedger
+            );
+            const polishTurn = await this.executeTurn(
+              request.projectSlug,
+              runId,
+              coordinator,
+              round,
+              polishPrompt,
+              coordinatorState,
+              eventSink,
+              `realtime-round-${round}-coordinator-polish`
+            );
+            turns.push(polishTurn);
+            if (polishTurn.status === "completed") {
+              await updateDiscussionLedger(polishTurn, extractDiscussionLedger(polishTurn.response, round));
+            }
+            await persistTurnsAndChat();
+            round += 1;
+            continue;
+          }
+
+          if (effectiveSectionOutcome === "write-final" && wholeDocumentReady) {
             const finalContextMarkdown = await buildCompiledContextMarkdown(currentDraft, round, "round", "full");
             const finalPrompt = buildRealtimeFinalDraftPrompt(
               finalContextMarkdown,
@@ -775,7 +847,16 @@ export class ReviewOrchestrator {
             break;
           }
 
-          if (currentSectionReady && discussionLedger && discussionLedger.deferredChallenges.length > 0) {
+          if (effectiveSectionOutcome === "handoff-next-section" && discussionLedger && nextCluster) {
+            discussionLedger = transitionDiscussionLedgerToNextCluster(discussionLedger, nextCluster, round);
+            await eventSink({
+              timestamp: nowIso(),
+              type: "discussion-ledger-updated",
+              round,
+              speakerRole: "system",
+              message: `Prepared the next target section handoff: ${nextCluster.sectionLabel}`,
+              discussionLedger
+            });
             round += 1;
             continue;
           }
@@ -1257,6 +1338,7 @@ function buildRealtimeCoordinatorDiscussionPrompt(
   const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
+  const challengeTicketsBlock = buildChallengeTicketBlock(ledger);
   const hasReviewerHistory = turns.some((turn) => turn.role === "reviewer" && turn.status === "completed" && turn.round > 0);
 
   return buildPrompt({
@@ -1264,7 +1346,7 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     contextProfile: "compact",
     contextMarkdown,
     notionBrief,
-    historyBlocks: [previousRoundBlock, historyBlock],
+    historyBlocks: [previousRoundBlock, challengeTicketsBlock, historyBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
     "You are the coordinator for a realtime multi-model essay review discussion.",
@@ -1274,14 +1356,20 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     "Return Markdown with exactly these top-level sections:",
     "## Current Focus",
     "## Target Section",
+    "## Target Section Key",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
     "## Deferred Challenges",
+    "## Section Outcome",
+    "## Challenge Decisions",
     "Write Current Focus as one line, Target Section as a short label, and Mini Draft as a 2-4 sentence candidate rewrite for only that target section.",
+    "Write Target Section Key as a stable slug for the current target section.",
     "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
     "Open Challenges are blockers for the current Target Section only.",
     "Deferred Challenges are valid follow-up issues for later sections or final polish.",
+    "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
+    "Use Challenge Decisions to mark ticket transitions with lines like '- [ticketId] close' or '- [new] add | sectionKey=... | sectionLabel=... | severity=advisory | text=...'.",
     "If Open Challenges are empty but Deferred Challenges remain, hand off Target Section to the next deferred issue instead of reopening the completed section.",
     hasReviewerHistory
       ? "Use the latest reviewer feedback and the previous ledger to move one unresolved issue closer to convergence."
@@ -1292,6 +1380,8 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
     ledgerBlock,
+    "",
+    challengeTicketsBlock,
     "",
     previousRoundBlock,
     "",
@@ -1315,6 +1405,7 @@ function buildRealtimeCoordinatorRedirectPrompt(
   const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
+  const challengeTicketsBlock = buildChallengeTicketBlock(ledger);
   const userMessageBlock = [
     "## New User Messages",
     ...messages.map((message, index) => `### Message ${index + 1}\n${message}`)
@@ -1325,7 +1416,7 @@ function buildRealtimeCoordinatorRedirectPrompt(
     contextProfile: "compact",
     contextMarkdown,
     notionBrief,
-    historyBlocks: [previousRoundBlock, historyBlock, userMessageBlock],
+    historyBlocks: [previousRoundBlock, challengeTicketsBlock, historyBlock, userMessageBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
     "You are the coordinator for a realtime multi-model essay review discussion.",
@@ -1335,14 +1426,20 @@ function buildRealtimeCoordinatorRedirectPrompt(
     "Return Markdown with exactly these top-level sections:",
     "## Current Focus",
     "## Target Section",
+    "## Target Section Key",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
     "## Deferred Challenges",
+    "## Section Outcome",
+    "## Challenge Decisions",
     "Acknowledge the new user message by reflecting it inside Current Focus and Mini Draft.",
+    "Write Target Section Key as a stable slug for the current target section.",
     "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
     "Open Challenges are blockers for the current Target Section only.",
     "Deferred Challenges are valid follow-up issues for later sections or final polish.",
+    "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
+    "Use Challenge Decisions to mark ticket transitions with lines like '- [ticketId] close' or '- [new] add | sectionKey=... | sectionLabel=... | severity=advisory | text=...'.",
     "If Open Challenges are empty but Deferred Challenges remain, hand off Target Section to the next deferred issue instead of reopening the completed section.",
     "Do not write the full essay yet.",
     "",
@@ -1351,6 +1448,8 @@ function buildRealtimeCoordinatorRedirectPrompt(
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
     ledgerBlock,
+    "",
+    challengeTicketsBlock,
     "",
     previousRoundBlock,
     "",
@@ -1388,6 +1487,7 @@ function buildRealtimeReviewerPrompt(
   const coordinatorReferenceBlock = buildCoordinatorReferenceBlock(visibleTurns, round, ledger);
   const reviewerReferenceBlock = buildReviewerReferencesBlock(visibleTurns, round, currentParticipantId);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger);
+  const challengeTicketsBlock = buildChallengeTicketBlock(ledger);
   const perspectiveInstruction = getPerspectiveInstruction(perspective);
   const crossFeedbackInstruction = 'Line 3 starts with "Cross-feedback:" and explicitly respond to exactly one reference using either "Cross-feedback: [refId] agree ..." or "Cross-feedback: [refId] disagree ...".';
 
@@ -1396,7 +1496,7 @@ function buildRealtimeReviewerPrompt(
     contextProfile: "minimal",
     contextMarkdown,
     notionBrief,
-    historyBlocks: [coordinatorReferenceBlock, reviewerReferenceBlock, historyBlock],
+    historyBlocks: [coordinatorReferenceBlock, reviewerReferenceBlock, challengeTicketsBlock, historyBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
     "You are a reviewer in a realtime multi-model essay discussion.",
@@ -1407,7 +1507,7 @@ function buildRealtimeReviewerPrompt(
     "Keep the blind review rule: do not assume anything about same-round reviewer replies that are not shown below.",
     "Respond in exactly 3 short labeled lines plus one final status line.",
     'Line 1 starts with "Mini Draft:" and identify one phrase or sentence in the Mini Draft to keep or revise.',
-    'Line 2 starts with "Challenge:" and say whether one Open Challenge should be closed now or remain open.',
+    'Line 2 starts with "Challenge:" and use exactly one verdict in the form "Challenge: [ticketId|new] close because ...", "Challenge: [ticketId|new] keep-open because ...", or "Challenge: [ticketId|new] defer because ...".',
     crossFeedbackInstruction,
     "The final line must be exactly one of these:",
     "Status: APPROVE",
@@ -1423,6 +1523,8 @@ function buildRealtimeReviewerPrompt(
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
     ledgerBlock,
+    "",
+    challengeTicketsBlock,
     "",
     coordinatorReferenceBlock,
     "",
@@ -1487,13 +1589,14 @@ function buildDevilsAdvocatePrompt(
   const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
   const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
   const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
+  const challengeTicketsBlock = buildChallengeTicketBlock(ledger);
 
   return buildPrompt({
     promptKind: "realtime-coordinator-challenge",
     contextProfile: "compact",
     contextMarkdown,
     notionBrief,
-    historyBlocks: [previousRoundBlock, historyBlock],
+    historyBlocks: [previousRoundBlock, challengeTicketsBlock, historyBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
     "You are the coordinator for a realtime multi-model essay review.",
@@ -1503,12 +1606,18 @@ function buildDevilsAdvocatePrompt(
     "Return Markdown with exactly these top-level sections:",
     "## Current Focus",
     "## Target Section",
+    "## Target Section Key",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
     "## Deferred Challenges",
+    "## Section Outcome",
+    "## Challenge Decisions",
     "Use this turn to challenge one assumption the reviewers accepted too quickly and add at least one concrete Open Challenge.",
+    "Write Target Section Key as a stable slug for the current target section.",
     "Deferred Challenges should capture later follow-up issues instead of blocking the current section.",
+    "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
+    "Use Challenge Decisions to mark ticket transitions with lines like '- [ticketId] close' or '- [new] add | sectionKey=... | sectionLabel=... | severity=advisory | text=...'.",
     "If the current section is already closed, redirect the next Target Section to one Deferred Challenge instead of reopening the same section.",
     "Do not write the full essay.",
     "",
@@ -1517,6 +1626,67 @@ function buildDevilsAdvocatePrompt(
     notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
     notionBrief ? "" : "",
     ledgerBlock,
+    "",
+    challengeTicketsBlock,
+    "",
+    previousRoundBlock,
+    "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    historyBlock
+    ]
+  });
+}
+
+function buildWeakConsensusPolishPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  turns: ReviewTurn[],
+  round: number,
+  ledger?: DiscussionLedger
+): BuiltPrompt {
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 320 });
+  const previousRoundBlock = buildPreviousRoundReviewerSummary(turns, round);
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger, "## Previous Discussion Ledger");
+  const challengeTicketsBlock = buildChallengeTicketBlock(ledger);
+
+  return buildPrompt({
+    promptKind: "realtime-coordinator-polish",
+    contextProfile: "compact",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [previousRoundBlock, challengeTicketsBlock, historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
+    "You are the coordinator for a realtime multi-model essay review discussion.",
+    buildRealtimeKoreanResponseInstruction(),
+    `Round: ${round}`,
+    "The current section is technically ready, but most reviewers still recommend advisory revisions.",
+    "Use one polish round to absorb advisory feedback without opening a new section yet.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Current Focus",
+    "## Target Section",
+    "## Target Section Key",
+    "## Mini Draft",
+    "## Accepted Decisions",
+    "## Open Challenges",
+    "## Deferred Challenges",
+    "## Section Outcome",
+    "## Challenge Decisions",
+    "Write Target Section Key as a stable slug for the current target section.",
+    "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
+    "Do not invent new blocker scope unless the reviewer feedback clearly justifies it.",
+    "Use Challenge Decisions to close, keep-open, defer, promote, or add tickets as needed.",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    ledgerBlock,
+    "",
+    challengeTicketsBlock,
     "",
     previousRoundBlock,
     "",
@@ -1616,12 +1786,29 @@ function buildDiscussionLedgerBlock(ledger?: DiscussionLedger, heading = "## Dis
   ].join("\n");
 }
 
+function buildChallengeTicketBlock(ledger?: DiscussionLedger): string {
+  const tickets = ledger?.tickets ?? [];
+  if (tickets.length === 0) {
+    return "## Challenge Tickets\n\n_No challenge tickets yet._";
+  }
+
+  return [
+    "## Challenge Tickets",
+    ...tickets.map((ticket) =>
+      `- [${ticket.id}] ${ticket.status} | ${ticket.severity} | sectionKey=${ticket.sectionKey} | sectionLabel=${ticket.sectionLabel} | text=${ticket.text}`
+    )
+  ].join("\n");
+}
+
 function buildDiscussionLedgerArtifact(ledger: DiscussionLedger): string {
+  const tickets = getLedgerTickets(ledger);
   return [
     "# Discussion Ledger",
     "",
     `- Updated At Round: ${ledger.updatedAtRound}`,
     `- Target Section: ${ledger.targetSection}`,
+    ...(ledger.targetSectionKey ? [`- Target Section Key: ${ledger.targetSectionKey}`] : []),
+    ...(ledger.sectionOutcome ? [`- Section Outcome: ${ledger.sectionOutcome}`] : []),
     "",
     "## Current Focus",
     ledger.currentFocus,
@@ -1636,7 +1823,16 @@ function buildDiscussionLedgerArtifact(ledger: DiscussionLedger): string {
     ...formatDiscussionLedgerItems(ledger.openChallenges),
     "",
     "## Deferred Challenges",
-    ...formatDiscussionLedgerItems(ledger.deferredChallenges)
+    ...formatDiscussionLedgerItems(ledger.deferredChallenges),
+    ...(tickets.length > 0
+      ? [
+          "",
+          "## Challenge Tickets",
+          ...tickets.map((ticket) =>
+            `- [${ticket.id}] ${ticket.severity} | ${ticket.status} | ${ticket.sectionKey} | ${ticket.text}`
+          )
+        ]
+      : [])
   ].join("\n");
 }
 
@@ -1652,13 +1848,41 @@ function extractDiscussionLedger(output: string, round: number): DiscussionLedge
     return undefined;
   }
 
+  const targetSectionKey =
+    normalizeLedgerSingleLine(extractMarkdownSection(output, "Target Section Key")) || normalizeSectionKey(targetSection);
+  const openChallenges = parseDiscussionLedgerItems(extractMarkdownSection(output, "Open Challenges"));
+  const deferredChallenges = parseDiscussionLedgerItems(extractMarkdownSection(output, "Deferred Challenges"));
+  const sectionOutcome = extractSectionOutcome(output);
+  const baseTickets = seedTicketsFromLegacyLedger({
+    targetSection,
+    targetSectionKey,
+    openChallenges,
+    deferredChallenges,
+    updatedAtRound: round
+  });
+  const challengeDecisions = extractChallengeDecisions(output);
+  const tickets = challengeDecisions.length > 0
+    ? applyCoordinatorChallengeDecisions({
+        baseTickets,
+        decisions: challengeDecisions,
+        targetSection,
+        targetSectionKey,
+        round
+      })
+    : baseTickets;
+  const derivedViews = challengeDecisions.length > 0
+    ? deriveLedgerViewsFromTickets(tickets, targetSectionKey)
+    : undefined;
   return {
     currentFocus,
     miniDraft,
     acceptedDecisions: parseDiscussionLedgerItems(extractMarkdownSection(output, "Accepted Decisions")),
-    openChallenges: parseDiscussionLedgerItems(extractMarkdownSection(output, "Open Challenges")),
-    deferredChallenges: parseDiscussionLedgerItems(extractMarkdownSection(output, "Deferred Challenges")),
+    openChallenges: derivedViews?.openChallenges ?? openChallenges,
+    deferredChallenges: derivedViews?.deferredChallenges ?? deferredChallenges,
     targetSection,
+    targetSectionKey,
+    tickets,
+    sectionOutcome,
     updatedAtRound: round
   };
 }
@@ -1686,6 +1910,369 @@ function parseDiscussionLedgerItems(section: string): string[] {
     .map((line) => line.replace(/^[-*]\s+/, "").trim())
     .filter((line) => line.length > 0)
     .filter((line) => !/^없음$/i.test(line));
+}
+
+function normalizeSectionKey(label: string): string {
+  const normalized = label
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || "section";
+}
+
+function seedTicketsFromLegacyLedger(input: {
+  targetSection: string;
+  targetSectionKey: string;
+  openChallenges: string[];
+  deferredChallenges: string[];
+  updatedAtRound: number;
+}): ChallengeTicket[] {
+  const tickets: ChallengeTicket[] = [];
+  const seenKeys = new Set<string>();
+  const addTicket = (
+    text: string,
+    status: ChallengeStatus,
+    severity: ChallengeSeverity,
+    sectionKey: string,
+    sectionLabel: string,
+    source: ChallengeSource,
+    handoffPriority: number
+  ) => {
+    const ticketId = buildChallengeTicketId(sectionKey, text);
+    if (!text || seenKeys.has(ticketId)) {
+      return;
+    }
+    seenKeys.add(ticketId);
+    tickets.push({
+      id: ticketId,
+      text,
+      sectionKey,
+      sectionLabel,
+      severity,
+      status,
+      source,
+      introducedAtRound: input.updatedAtRound,
+      lastUpdatedAtRound: input.updatedAtRound,
+      handoffPriority
+    });
+  };
+
+  input.openChallenges.forEach((challenge, index) => {
+    addTicket(
+      challenge,
+      "open",
+      "blocking",
+      input.targetSectionKey,
+      input.targetSection,
+      "system",
+      100 - index
+    );
+  });
+
+  input.deferredChallenges.forEach((challenge, index) => {
+    const deferredSectionKey = normalizeSectionKey(challenge);
+    addTicket(
+      challenge,
+      "deferred",
+      "advisory",
+      deferredSectionKey,
+      challenge,
+      "system",
+      50 - index
+    );
+  });
+
+  return tickets;
+}
+
+function buildChallengeTicketId(sectionKey: string, text: string): string {
+  const normalizedSection = normalizeSectionKey(sectionKey).slice(0, 24);
+  const normalizedText = normalizeSectionKey(text).slice(0, 24);
+  return `ticket-${normalizedSection || "section"}-${normalizedText || "challenge"}`;
+}
+
+function extractSectionOutcome(output: string): SectionOutcome | undefined {
+  const raw = normalizeLedgerSingleLine(extractMarkdownSection(output, "Section Outcome"));
+  if (raw === "keep-open" || raw === "close-section" || raw === "handoff-next-section" || raw === "write-final") {
+    return raw;
+  }
+  return undefined;
+}
+
+function extractChallengeDecisions(output: string): Array<ParsedChallengeDecision | ParsedChallengeAddDecision> {
+  const section = extractMarkdownSection(output, "Challenge Decisions");
+  if (!section) {
+    return [];
+  }
+
+  const decisions: Array<ParsedChallengeDecision | ParsedChallengeAddDecision> = [];
+  for (const rawLine of section.split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/^[-*]\s+/, "").trim();
+    if (!line) {
+      continue;
+    }
+
+    const actionMatch = line.match(/^\[(.+?)\]\s+(close|keep-open|defer|promote)\s*$/i);
+    if (actionMatch) {
+      decisions.push({
+        ticketId: actionMatch[1],
+        action: actionMatch[2].toLowerCase() as ParsedChallengeDecision["action"]
+      });
+      continue;
+    }
+
+    const addMatch = line.match(/^\[(new)\]\s+add\s*\|\s*(.+)$/i);
+    if (!addMatch) {
+      continue;
+    }
+
+    const fields = addMatch[2]
+      .split("|")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .reduce<Record<string, string>>((acc, part) => {
+        const [key, ...rest] = part.split("=");
+        if (!key || rest.length === 0) {
+          return acc;
+        }
+        acc[key.trim()] = rest.join("=").trim();
+        return acc;
+      }, {});
+    const severity = fields.severity === "blocking" || fields.severity === "advisory"
+      ? fields.severity
+      : undefined;
+    decisions.push({
+      ticketId: "new",
+      action: "add",
+      sectionKey: fields.sectionKey,
+      sectionLabel: fields.sectionLabel,
+      severity,
+      text: fields.text
+    });
+  }
+
+  return decisions;
+}
+
+function applyCoordinatorChallengeDecisions(input: {
+  baseTickets: ChallengeTicket[];
+  decisions: Array<ParsedChallengeDecision | ParsedChallengeAddDecision>;
+  targetSection: string;
+  targetSectionKey: string;
+  round: number;
+}): ChallengeTicket[] {
+  const tickets = new Map(input.baseTickets.map((ticket) => [ticket.id, { ...ticket }]));
+  for (const decision of input.decisions) {
+    if (decision.action === "add") {
+      if (!decision.text) {
+        continue;
+      }
+      const sectionKey = decision.sectionKey ? normalizeSectionKey(decision.sectionKey) : input.targetSectionKey;
+      const sectionLabel = decision.sectionLabel?.trim() || input.targetSection;
+      const id = buildChallengeTicketId(sectionKey, decision.text);
+      tickets.set(id, {
+        id,
+        text: decision.text,
+        sectionKey,
+        sectionLabel,
+        severity: decision.severity ?? "advisory",
+        status: sectionKey === input.targetSectionKey ? "open" : "deferred",
+        source: "coordinator",
+        introducedAtRound: input.round,
+        lastUpdatedAtRound: input.round,
+        handoffPriority: 100
+      });
+      continue;
+    }
+
+    const ticket = tickets.get(decision.ticketId);
+    if (!ticket) {
+      continue;
+    }
+
+    if (decision.action === "close") {
+      ticket.status = "closed";
+    } else if (decision.action === "defer") {
+      ticket.status = "deferred";
+    } else {
+      ticket.status = "open";
+      ticket.sectionKey = input.targetSectionKey;
+      ticket.sectionLabel = input.targetSection;
+    }
+    ticket.lastUpdatedAtRound = input.round;
+    tickets.set(ticket.id, ticket);
+  }
+
+  return [...tickets.values()];
+}
+
+function deriveLedgerViewsFromTickets(
+  tickets: ChallengeTicket[],
+  targetSectionKey: string
+): { openChallenges: string[]; deferredChallenges: string[] } {
+  const openChallenges = tickets
+    .filter((ticket) => ticket.status === "open" && ticket.sectionKey === targetSectionKey)
+    .map((ticket) => ticket.text);
+  const deferredChallenges = tickets
+    .filter((ticket) => ticket.status === "deferred" || (ticket.status === "open" && ticket.sectionKey !== targetSectionKey))
+    .map((ticket) => ticket.text);
+  return {
+    openChallenges: dedupeStrings(openChallenges),
+    deferredChallenges: dedupeStrings(deferredChallenges)
+  };
+}
+
+function dedupeStrings(items: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const item of items) {
+    if (!item || seen.has(item)) {
+      continue;
+    }
+    seen.add(item);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
+function getLedgerTargetSectionKey(ledger?: DiscussionLedger): string {
+  return ledger?.targetSectionKey || (ledger ? normalizeSectionKey(ledger.targetSection) : "section");
+}
+
+function getLedgerTickets(ledger?: DiscussionLedger): ChallengeTicket[] {
+  if (!ledger) {
+    return [];
+  }
+  if (ledger.tickets && ledger.tickets.length > 0) {
+    return ledger.tickets;
+  }
+  return seedTicketsFromLegacyLedger({
+    targetSection: ledger.targetSection,
+    targetSectionKey: getLedgerTargetSectionKey(ledger),
+    openChallenges: ledger.openChallenges,
+    deferredChallenges: ledger.deferredChallenges,
+    updatedAtRound: ledger.updatedAtRound
+  });
+}
+
+function pickNextTargetSectionCluster(ledger?: DiscussionLedger): ChallengeTicketCluster | undefined {
+  if (!ledger) {
+    return undefined;
+  }
+
+  const currentSectionKey = getLedgerTargetSectionKey(ledger);
+  const tickets = getLedgerTickets(ledger).filter(
+    (ticket) => ticket.status !== "closed" && ticket.sectionKey !== currentSectionKey
+  );
+  if (tickets.length === 0) {
+    return undefined;
+  }
+
+  const clusters = new Map<string, ChallengeTicketCluster>();
+  for (const ticket of tickets) {
+    const existing = clusters.get(ticket.sectionKey);
+    if (existing) {
+      existing.tickets.push(ticket);
+      if (ticket.lastUpdatedAtRound >= existing.tickets[0].lastUpdatedAtRound) {
+        existing.sectionLabel = ticket.sectionLabel;
+      }
+      continue;
+    }
+    clusters.set(ticket.sectionKey, {
+      sectionKey: ticket.sectionKey,
+      sectionLabel: ticket.sectionLabel,
+      tickets: [ticket]
+    });
+  }
+
+  return [...clusters.values()].sort((left, right) => {
+    const leftHasBlocking = left.tickets.some((ticket) => ticket.severity === "blocking") ? 1 : 0;
+    const rightHasBlocking = right.tickets.some((ticket) => ticket.severity === "blocking") ? 1 : 0;
+    if (leftHasBlocking !== rightHasBlocking) {
+      return rightHasBlocking - leftHasBlocking;
+    }
+
+    const leftPriority = Math.max(...left.tickets.map((ticket) => ticket.handoffPriority));
+    const rightPriority = Math.max(...right.tickets.map((ticket) => ticket.handoffPriority));
+    if (leftPriority !== rightPriority) {
+      return rightPriority - leftPriority;
+    }
+
+    const leftRound = Math.min(...left.tickets.map((ticket) => ticket.introducedAtRound));
+    const rightRound = Math.min(...right.tickets.map((ticket) => ticket.introducedAtRound));
+    if (leftRound !== rightRound) {
+      return leftRound - rightRound;
+    }
+
+    return right.tickets.length - left.tickets.length;
+  })[0];
+}
+
+function validateSectionOutcome(
+  requestedOutcome: SectionOutcome | undefined,
+  options: { currentSectionReady: boolean; wholeDocumentReady: boolean; hasNextCluster: boolean }
+): SectionOutcome {
+  if (options.wholeDocumentReady) {
+    return "write-final";
+  }
+  if (options.currentSectionReady && options.hasNextCluster) {
+    return "handoff-next-section";
+  }
+  if (options.currentSectionReady) {
+    return requestedOutcome === "keep-open" ? "keep-open" : "close-section";
+  }
+  return "keep-open";
+}
+
+function transitionDiscussionLedgerToNextCluster(
+  ledger: DiscussionLedger,
+  cluster: ChallengeTicketCluster,
+  round: number
+): DiscussionLedger {
+  const tickets = getLedgerTickets(ledger).map((ticket) => {
+    if (ticket.sectionKey !== cluster.sectionKey || ticket.status === "closed") {
+      return ticket;
+    }
+    return {
+      ...ticket,
+      status: "open" as const,
+      lastUpdatedAtRound: round
+    };
+  });
+  const derivedViews = deriveLedgerViewsFromTickets(tickets, cluster.sectionKey);
+  return {
+    ...ledger,
+    currentFocus: `${cluster.sectionLabel} 섹션으로 handoff해 남은 쟁점을 정리합니다.`,
+    targetSection: cluster.sectionLabel,
+    targetSectionKey: cluster.sectionKey,
+    miniDraft: `${cluster.sectionLabel} 미니 초안을 다음 라운드에서 새로 정리합니다.`,
+    openChallenges: derivedViews.openChallenges,
+    deferredChallenges: derivedViews.deferredChallenges,
+    tickets,
+    sectionOutcome: "handoff-next-section",
+    updatedAtRound: round
+  };
+}
+
+function shouldRunWeakConsensusPolish(
+  activeReviewers: ReviewParticipant[],
+  statuses: Map<string, RealtimeReviewerStatus>,
+  currentSectionKey: string,
+  polishRoundsUsed: Set<string>
+): boolean {
+  if (polishRoundsUsed.has(currentSectionKey) || activeReviewers.length === 0) {
+    return false;
+  }
+
+  let reviseCount = 0;
+  for (const reviewer of activeReviewers) {
+    if (statuses.get(reviewer.participantId) === "REVISE") {
+      reviseCount += 1;
+    }
+  }
+
+  return reviseCount > Math.floor(activeReviewers.length / 2);
 }
 
 function extractNotionBrief(response: string): string {
@@ -1984,6 +2571,11 @@ function buildRealtimeReferenceBlock(heading: string, references: RealtimeRefere
 }
 
 function extractRealtimeReviewerObjection(response: string): string {
+  const normalizedChallenge = extractNormalizedReviewerChallenge(response);
+  if (normalizedChallenge) {
+    return `[${normalizedChallenge.ticketId}] ${normalizedChallenge.action} because ${normalizedChallenge.reason}`;
+  }
+
   const challenge = extractRealtimeLabeledLine(response, "Challenge");
   if (challenge) {
     return challenge;
@@ -2005,6 +2597,24 @@ function extractRealtimeLabeledLine(response: string, label: string): string {
   }
 
   return matches[matches.length - 1][1].trim();
+}
+
+function extractNormalizedReviewerChallenge(response: string): ParsedReviewerChallengeVerdict | undefined {
+  const challenge = extractRealtimeLabeledLine(response, "Challenge");
+  if (!challenge) {
+    return undefined;
+  }
+
+  const match = challenge.match(/^\[(.+?)\]\s+(close|keep-open|defer)\s+because\s+(.+)$/i);
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    ticketId: match[1].trim(),
+    action: match[2].toLowerCase() as ParsedReviewerChallengeVerdict["action"],
+    reason: match[3].replace(/\s+/g, " ").trim()
+  };
 }
 
 function extractReviewerObjection(response: string): string {
@@ -2075,7 +2685,15 @@ function isCurrentSectionReady(
   activeReviewers: ReviewParticipant[],
   statuses: Map<string, RealtimeReviewerStatus>
 ): boolean {
-  return ledger !== undefined && ledger.openChallenges.length === 0 && !hasBlockingRealtimeReviewer(activeReviewers, statuses);
+  if (!ledger) {
+    return false;
+  }
+
+  const targetSectionKey = getLedgerTargetSectionKey(ledger);
+  const hasOpenBlockingTickets = getLedgerTickets(ledger).some(
+    (ticket) => ticket.status === "open" && ticket.sectionKey === targetSectionKey && ticket.severity === "blocking"
+  );
+  return !hasOpenBlockingTickets && !hasBlockingRealtimeReviewer(activeReviewers, statuses);
 }
 
 function isWholeDocumentReady(
@@ -2083,7 +2701,7 @@ function isWholeDocumentReady(
   activeReviewers: ReviewParticipant[],
   statuses: Map<string, RealtimeReviewerStatus>
 ): boolean {
-  return isCurrentSectionReady(ledger, activeReviewers, statuses) && ledger !== undefined && ledger.deferredChallenges.length === 0;
+  return isCurrentSectionReady(ledger, activeReviewers, statuses) && !pickNextTargetSectionCluster(ledger);
 }
 
 function appendContinuationContext(

@@ -26,6 +26,25 @@ export const compileContextProfiles = ["full", "compact", "minimal"] as const;
 export type CompileContextProfile = (typeof compileContextProfiles)[number];
 
 export type DocumentScope = "profile" | "project";
+export type ChallengeSeverity = "blocking" | "advisory";
+export type ChallengeStatus = "open" | "deferred" | "closed";
+export type ChallengeSource = "coordinator" | "reviewer" | "user" | "system";
+export type SectionOutcome = "keep-open" | "close-section" | "handoff-next-section" | "write-final";
+
+export interface ChallengeTicket {
+  id: string;
+  text: string;
+  sectionKey: string;
+  sectionLabel: string;
+  severity: ChallengeSeverity;
+  status: ChallengeStatus;
+  source: ChallengeSource;
+  introducedAtRound: number;
+  lastUpdatedAtRound: number;
+  handoffPriority: number;
+  evidenceNeeded?: string;
+  closeCondition?: string;
+}
 
 export interface ProviderStatus {
   providerId: ProviderId;
@@ -126,6 +145,9 @@ export interface DiscussionLedger {
   openChallenges: string[];
   deferredChallenges: string[];
   targetSection: string;
+  targetSectionKey?: string;
+  tickets?: ChallengeTicket[];
+  sectionOutcome?: SectionOutcome;
   updatedAtRound: number;
 }
 
