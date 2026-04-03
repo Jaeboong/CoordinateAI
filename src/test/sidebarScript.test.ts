@@ -45,6 +45,9 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /project-fold-summary/);
   assert.match(script, /rememberCurrentTabScroll/);
   assert.match(script, /restoreSelectedTabScroll/);
+  assert.match(script, /pendingInteractionScrollTop/);
+  assert.match(script, /setInteractionScrollAnchor/);
+  assert.match(script, /consumeInteractionScrollAnchor/);
   assert.match(script, /reset-project-rubric/);
   assert.match(script, /회사 이름/);
   assert.match(script, /포지션/);

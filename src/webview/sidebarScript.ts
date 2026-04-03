@@ -35,6 +35,7 @@ const stateSource = String.raw`
       let chatPumpHandle = null;
       let bannerDrainHandle = null;
       let scrollRestoreHandle = null;
+      let pendingInteractionScrollTop = null;
       const customModelOptionValue = "__custom__";
 
       const tabLabels = {
@@ -146,6 +147,16 @@ const stateSource = String.raw`
 
       function currentScrollTop() {
         return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+      }
+
+      function setInteractionScrollAnchor() {
+        pendingInteractionScrollTop = currentScrollTop();
+      }
+
+      function consumeInteractionScrollAnchor() {
+        const anchor = pendingInteractionScrollTop;
+        pendingInteractionScrollTop = null;
+        return typeof anchor === "number" ? anchor : null;
       }
 
       function rememberCurrentTabScroll() {
@@ -1193,8 +1204,12 @@ const renderSource = String.raw`
         restoreSelectedTabScroll();
       }
 
-      function rerenderView() {
-        rememberCurrentTabScroll();
+      function rerenderView(anchorScrollTop) {
+        if (selectedTab) {
+          tabScrollPositions[selectedTab] = typeof anchorScrollTop === "number"
+            ? anchorScrollTop
+            : currentScrollTop();
+        }
         render();
         persistState();
       }
@@ -2286,6 +2301,14 @@ const domEventSource = String.raw`
         rememberCurrentTabScroll();
       }, { passive: true });
 
+      document.addEventListener("pointerdown", (event) => {
+        const target = event.target instanceof Element ? event.target.closest("select, input[type='checkbox'], [data-action='toggle-collapsible'], [data-action='toggle-run-role-advanced']") : null;
+        if (!target) {
+          return;
+        }
+        setInteractionScrollAnchor();
+      }, { passive: true });
+
       document.addEventListener("click", (event) => {
         const target = event.target.closest("[data-action]");
         if (!target) {
@@ -2304,10 +2327,8 @@ const domEventSource = String.raw`
           if (!key || !(key in defaultCollapsibleStates)) {
             return;
           }
-          rememberCurrentTabScroll();
           setCollapsibleOpen(key, !isCollapsibleOpen(key));
-          render();
-          persistState();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "test-provider") {
@@ -2384,7 +2405,7 @@ const domEventSource = String.raw`
           if (projectDocumentEditor && projectDocumentEditor.projectSlug !== selectedProjectSlug) {
             projectDocumentEditor = null;
           }
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "delete-project") {
@@ -2440,7 +2461,7 @@ const domEventSource = String.raw`
         }
         if (action === "toggle-run-role-advanced") {
           runRoleAdvancedOpen = !runRoleAdvancedOpen;
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "toggle-run-extra-doc") {
@@ -2464,7 +2485,7 @@ const domEventSource = String.raw`
             current.add(documentId);
           }
           runFormState.selectedDocumentIds = [...current];
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "load-run-continuation") {
@@ -2483,13 +2504,13 @@ const domEventSource = String.raw`
           runContinuation = null;
           runRoleAssignments = [];
           syncRunProviderSelections(healthyRunProviders());
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "reset-run-form") {
           resetRunFormState();
           setCollapsibleOpen("runSetup", true);
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "open-artifact") {
@@ -2532,7 +2553,7 @@ const domEventSource = String.raw`
           const providerId = target.dataset.provider;
           providerModelSelections[providerId] = target.value;
           if (target.value === customModelOptionValue) {
-            rerenderView();
+            rerenderView(consumeInteractionScrollAnchor());
             return;
           }
           providerCustomModels[providerId] = "";
@@ -2546,7 +2567,7 @@ const domEventSource = String.raw`
         }
         if (action === "set-review-mode") {
           selectedReviewMode = normalizeReviewMode(target.value);
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "set-run-role-provider") {
@@ -2557,7 +2578,7 @@ const domEventSource = String.raw`
           updateRunRoleAssignment(roleKey, {
             providerId: target.value || ""
           });
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "toggle-run-role-defaults") {
@@ -2568,7 +2589,7 @@ const domEventSource = String.raw`
           updateRunRoleAssignment(roleKey, {
             useProviderDefaults: target.checked
           });
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "set-run-role-model") {
@@ -2582,7 +2603,7 @@ const domEventSource = String.raw`
             modelOverride: nextModelOverride,
             useProviderDefaults: !(nextModelOverride || currentAssignment?.effortOverride)
           });
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "set-run-role-effort") {
@@ -2596,7 +2617,7 @@ const domEventSource = String.raw`
             effortOverride: nextEffortOverride,
             useProviderDefaults: !(currentAssignment?.modelOverride || nextEffortOverride)
           });
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "set-selected-project") {
@@ -2607,7 +2628,7 @@ const domEventSource = String.raw`
           if (projectDocumentEditor && projectDocumentEditor.projectSlug !== selectedProjectSlug) {
             projectDocumentEditor = null;
           }
-          rerenderView();
+          rerenderView(consumeInteractionScrollAnchor());
           return;
         }
         if (action === "toggle-profile-pinned") {
