@@ -20,6 +20,8 @@ const stateSource = String.raw`
       let providerModelSelections = restored.providerModelSelections || {};
       let providerCustomModels = restored.providerCustomModels || {};
       let selectedReviewMode = restored.selectedReviewMode || null;
+      let runRoleAssignments = Array.isArray(restored.runRoleAssignments) ? restored.runRoleAssignments : [];
+      let runRoleAdvancedOpen = Boolean(restored.runRoleAdvancedOpen);
       let runCoordinatorSelection = restored.runCoordinatorSelection || null;
       let runReviewerSelections = Array.isArray(restored.runReviewerSelections) ? restored.runReviewerSelections : [];
       let runFormState = restored.runFormState || null;
@@ -52,6 +54,60 @@ const stateSource = String.raw`
         realtime: "실시간 대화형",
         deepFeedback: "심화 피드백"
       };
+
+      const runRoleDefinitions = Object.freeze([
+        {
+          roleKey: "context_researcher",
+          label: "컨텍스트 리서처",
+          groupKey: "research",
+          description: "회사, 직무, 문항 맥락을 조사합니다."
+        },
+        {
+          roleKey: "section_coordinator",
+          label: "섹션 코디네이터",
+          groupKey: "drafting",
+          description: "조사 결과를 섹션별 작업으로 배분하고 순서를 잡습니다."
+        },
+        {
+          roleKey: "section_drafter",
+          label: "섹션 드래프터",
+          groupKey: "drafting",
+          description: "실제 초안을 작성합니다."
+        },
+        {
+          roleKey: "fit_reviewer",
+          label: "적합성 리뷰어",
+          groupKey: "review",
+          description: "직무와 회사에 맞는지 검토합니다."
+        },
+        {
+          roleKey: "evidence_reviewer",
+          label: "근거 리뷰어",
+          groupKey: "review",
+          description: "사실과 근거의 정확성을 확인합니다."
+        },
+        {
+          roleKey: "voice_reviewer",
+          label: "문체 리뷰어",
+          groupKey: "review",
+          description: "자기소개서의 목소리와 어조를 다듬습니다."
+        },
+        {
+          roleKey: "finalizer",
+          label: "파이널라이저",
+          groupKey: "drafting",
+          description: "모든 수정을 통합해 최종본으로 정리합니다."
+        }
+      ]);
+      const runRoleDefinitionsByKey = Object.fromEntries(runRoleDefinitions.map((role) => [role.roleKey, role]));
+      const runRoleOrder = runRoleDefinitions.map((role) => role.roleKey);
+      const runRoleGroupOrder = Object.freeze(["research", "drafting", "review"]);
+      const runRoleGroupLabels = {
+        research: "조사",
+        drafting: "작성",
+        review: "검토"
+      };
+      const runReviewerRoleKeys = Object.freeze(["fit_reviewer", "evidence_reviewer", "voice_reviewer"]);
 
       const defaultReviewModeValue = "deepFeedback";
 
@@ -176,8 +232,14 @@ const stateSource = String.raw`
 
       function speakerRoleLabel(role) {
         switch (role) {
+          case "researcher":
+            return "리서처";
           case "coordinator":
             return "코디네이터";
+          case "drafter":
+            return "드래프터";
+          case "finalizer":
+            return "파이널라이저";
           case "reviewer":
             return "리뷰어";
           case "user":
@@ -191,9 +253,209 @@ const stateSource = String.raw`
         return \`리뷰어 \${count}명\`;
       }
 
+      function roleCountLabel(count) {
+        return \`역할 \${count}개\`;
+      }
+
       function runIterationLabel(run) {
         const unit = normalizeReviewMode(run.reviewMode) === "realtime" ? "라운드" : "사이클";
         return \`\${run.rounds} \${unit}\`;
+      }
+
+      function defaultRunRoleProviderId(roleKey, healthyProviders) {
+        const providerIds = healthyProviders.map((provider) => provider.providerId);
+        const primary = providerIds[0] || "";
+        const secondary = providerIds[1] || primary;
+        const tertiary = providerIds[2] || secondary || primary;
+
+        switch (roleKey) {
+          case "context_researcher":
+            return primary;
+          case "section_coordinator":
+            return primary;
+          case "section_drafter":
+            return secondary;
+          case "fit_reviewer":
+            return primary;
+          case "evidence_reviewer":
+            return secondary;
+          case "voice_reviewer":
+            return tertiary;
+          case "finalizer":
+            return secondary;
+          default:
+            return primary;
+        }
+      }
+
+      function normalizeRoleEffort(value) {
+        return String(value || "").trim();
+      }
+
+      function normalizeRunRoleAssignment(raw, healthyProviders, fallbackProviderId) {
+        const healthyIds = new Set(healthyProviders.map((provider) => provider.providerId));
+        const roleKey = String(raw?.roleKey || raw?.role || "").trim();
+        const providerId = String(raw?.providerId || "").trim();
+        const sanitizedProviderId = healthyIds.size === 0
+          ? providerId || fallbackProviderId || ""
+          : (healthyIds.has(providerId) ? providerId : fallbackProviderId || healthyProviders[0]?.providerId || "");
+        const modelOverride = String(raw?.modelOverride || "").trim();
+        const effortOverride = normalizeRoleEffort(String(raw?.effortOverride || "").trim());
+        const useProviderDefaults = typeof raw?.useProviderDefaults === "boolean"
+          ? raw.useProviderDefaults
+          : !(modelOverride || effortOverride);
+
+        return {
+          roleKey,
+          providerId: sanitizedProviderId,
+          modelOverride,
+          effortOverride,
+          useProviderDefaults
+        };
+      }
+
+      function defaultRunRoleAssignments(healthyProviders) {
+        return runRoleOrder.map((roleKey) => {
+          const providerId = defaultRunRoleProviderId(roleKey, healthyProviders);
+          return {
+            roleKey,
+            providerId,
+            modelOverride: "",
+            effortOverride: "",
+            useProviderDefaults: true
+          };
+        });
+      }
+
+      function normalizeRunRoleAssignments(rawAssignments, healthyProviders) {
+        const defaults = defaultRunRoleAssignments(healthyProviders);
+        const rawMap = new Map();
+        if (Array.isArray(rawAssignments)) {
+          for (const assignment of rawAssignments) {
+            const roleKey = String(assignment?.roleKey || assignment?.role || "").trim();
+            if (assignment && typeof assignment === "object" && roleKey) {
+              rawMap.set(roleKey, assignment);
+            }
+          }
+        }
+
+        return runRoleOrder.map((roleKey) => {
+          const base = defaults.find((assignment) => assignment.roleKey === roleKey) || {
+            roleKey,
+            providerId: "",
+            modelOverride: "",
+            effortOverride: "",
+            useProviderDefaults: true
+          };
+          return normalizeRunRoleAssignment(rawMap.get(roleKey) || base, healthyProviders, base.providerId);
+        });
+      }
+
+      function buildContinuationRunRoleAssignments(continuation, healthyProviders) {
+        if (Array.isArray(continuation?.roleAssignments) && continuation.roleAssignments.length > 0) {
+          return normalizeRunRoleAssignments(continuation.roleAssignments, healthyProviders);
+        }
+
+        const coordinatorProvider = continuation?.coordinatorProvider || "";
+        const reviewerProviders = Array.isArray(continuation?.reviewerProviders) ? continuation.reviewerProviders : [];
+        const derivedAssignments = [
+          { roleKey: "context_researcher", providerId: coordinatorProvider },
+          { roleKey: "section_coordinator", providerId: coordinatorProvider },
+          { roleKey: "section_drafter", providerId: reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "fit_reviewer", providerId: reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "evidence_reviewer", providerId: reviewerProviders[1] || reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "voice_reviewer", providerId: reviewerProviders[2] || reviewerProviders[1] || reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "finalizer", providerId: reviewerProviders[0] || coordinatorProvider }
+        ];
+
+        return normalizeRunRoleAssignments(derivedAssignments, healthyProviders);
+      }
+
+      function buildLegacyRunRoleAssignments(healthyProviders) {
+        const coordinatorProvider = runCoordinatorSelection || "";
+        const reviewerProviders = Array.isArray(runReviewerSelections) ? runReviewerSelections : [];
+        const derivedAssignments = [
+          { roleKey: "context_researcher", providerId: coordinatorProvider },
+          { roleKey: "section_coordinator", providerId: coordinatorProvider },
+          { roleKey: "section_drafter", providerId: reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "fit_reviewer", providerId: reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "evidence_reviewer", providerId: reviewerProviders[1] || reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "voice_reviewer", providerId: reviewerProviders[2] || reviewerProviders[1] || reviewerProviders[0] || coordinatorProvider },
+          { roleKey: "finalizer", providerId: reviewerProviders[0] || coordinatorProvider }
+        ];
+
+        return normalizeRunRoleAssignments(derivedAssignments, healthyProviders);
+      }
+
+      function runRoleAssignmentByKey(roleKey) {
+        return runRoleAssignments.find((assignment) => assignment.roleKey === roleKey) || null;
+      }
+
+      function updateRunRoleAssignment(roleKey, updates) {
+        runRoleAssignments = runRoleAssignments.map((assignment) => {
+          if (assignment.roleKey !== roleKey) {
+            return assignment;
+          }
+          return {
+            ...assignment,
+            ...updates
+          };
+        });
+        syncLegacyRunSelectionsFromRoles();
+      }
+
+      function syncLegacyRunSelectionsFromRoles() {
+        const coordinatorAssignment = runRoleAssignmentByKey("section_coordinator");
+        runCoordinatorSelection = coordinatorAssignment?.providerId || null;
+        runReviewerSelections = runReviewerRoleKeys
+          .map((roleKey) => runRoleAssignmentByKey(roleKey)?.providerId || "")
+          .filter(Boolean);
+      }
+
+      function providerLabel(providerId) {
+        return providerLabels[providerId] || providerId || "없음";
+      }
+
+      function providerConfiguredModelLabel(providerId) {
+        const provider = (appState?.providers || []).find((item) => item.providerId === providerId);
+        if (!provider) {
+          return "";
+        }
+
+        const selectedModel = providerCustomModels[providerId] || provider.configuredModel || "";
+        const selectedEffort = provider.configuredEffort || "";
+        const pieces = [];
+        if (selectedModel) {
+          pieces.push(selectedModel);
+        }
+        if (selectedEffort) {
+          pieces.push(selectedEffort);
+        }
+        return pieces.join(" · ");
+      }
+
+      function roleOverrideSummary(roleAssignment) {
+        if (!roleAssignment) {
+          return "";
+        }
+
+        if (roleAssignment.useProviderDefaults) {
+          return "기본값 상속";
+        }
+
+        const pieces = [];
+        if (roleAssignment.modelOverride) {
+          pieces.push(\`모델 \${roleAssignment.modelOverride}\`);
+        }
+        if (roleAssignment.effortOverride) {
+          pieces.push(\`effort \${roleAssignment.effortOverride}\`);
+        }
+        return pieces.length > 0 ? pieces.join(" · ") : "기본값 상속";
+      }
+
+      function roleAssignmentStatusLabel(roleAssignment) {
+        const summary = providerConfiguredModelLabel(roleAssignment?.providerId);
+        return summary ? \`\${providerLabel(roleAssignment?.providerId)} · \${summary}\` : providerLabel(roleAssignment?.providerId);
       }
 
       function revisedDraftButtonLabel(run) {
@@ -388,6 +650,8 @@ const stateSource = String.raw`
           providerModelSelections,
           providerCustomModels,
           selectedReviewMode,
+          runRoleAssignments,
+          runRoleAdvancedOpen,
           runCoordinatorSelection,
           runReviewerSelections,
           runFormState,
@@ -430,46 +694,29 @@ const stateSource = String.raw`
           continuationNote: "",
           selectedDocumentIds: []
         };
-        runCoordinatorSelection = null;
-        runReviewerSelections = [];
+        runRoleAssignments = [];
+        runRoleAdvancedOpen = false;
         syncRunProviderSelections(healthyRunProviders());
         ensureRunFormState(extraDocuments || []);
       }
 
       function syncRunProviderSelections(healthyProviders) {
-        const healthyIds = new Set(healthyProviders.map((provider) => provider.providerId));
         if (healthyProviders.length === 0) {
-          runCoordinatorSelection = null;
-          runReviewerSelections = [];
+          runRoleAssignments = normalizeRunRoleAssignments(runRoleAssignments, healthyProviders);
+          syncLegacyRunSelectionsFromRoles();
           return;
         }
 
-        const continuationCoordinator = runContinuation?.coordinatorProvider;
-        if (!runCoordinatorSelection || !healthyIds.has(runCoordinatorSelection)) {
-          const preferredCoordinator = appState?.preferences?.lastCoordinatorProvider;
-          if (continuationCoordinator && healthyIds.has(continuationCoordinator)) {
-            runCoordinatorSelection = continuationCoordinator;
-          } else {
-            runCoordinatorSelection = preferredCoordinator && healthyIds.has(preferredCoordinator)
-              ? preferredCoordinator
-              : healthyProviders[0].providerId;
-          }
-        }
-
-        const sourceReviewers = runReviewerSelections.length > 0
-          ? runReviewerSelections
-          : (runContinuation?.reviewerProviders || []);
-        const sanitizedReviewers = sourceReviewers.filter((providerId) => healthyIds.has(providerId));
-        if (sanitizedReviewers.length > 0) {
-          runReviewerSelections = sanitizedReviewers;
-          return;
-        }
-
-        const fallbackReviewer = healthyProviders.find((provider) => provider.providerId !== runCoordinatorSelection)?.providerId
-          || runCoordinatorSelection
-          || healthyProviders[0]?.providerId
-          || "";
-        runReviewerSelections = fallbackReviewer ? [fallbackReviewer] : [];
+        const hasRoleAssignments = Array.isArray(runRoleAssignments) && runRoleAssignments.length > 0;
+        const sourceAssignments = hasRoleAssignments
+          ? runRoleAssignments
+          : (runContinuation
+            ? buildContinuationRunRoleAssignments(runContinuation, healthyProviders)
+            : ((runCoordinatorSelection || runReviewerSelections.length > 0)
+              ? buildLegacyRunRoleAssignments(healthyProviders)
+              : defaultRunRoleAssignments(healthyProviders)));
+        runRoleAssignments = normalizeRunRoleAssignments(sourceAssignments, healthyProviders);
+        syncLegacyRunSelectionsFromRoles();
       }
 
       function applyChatEvent(event) {
@@ -478,8 +725,8 @@ const stateSource = String.raw`
           return;
         }
 
-        if (event.type === "chat-message-started" && event.speakerRole === "coordinator" && event.round === 0) {
-          collapseCoordinatorPrePass(event.providerId, messageId);
+        if (event.type === "chat-message-started" && isNotionPrepassMessage(event)) {
+          collapseResearcherPrePass(event.providerId, messageId);
         }
 
         let message = runChatMessages.find((item) => item.id === messageId);
@@ -529,14 +776,19 @@ const stateSource = String.raw`
         }
       }
 
-      function collapseCoordinatorPrePass(providerId, currentMessageId) {
+      function isNotionPrepassMessage(message) {
+        return message?.round === 0 && (
+          message?.participantId === "context-researcher" ||
+          message?.speakerRole === "researcher"
+        );
+      }
+
+      function collapseResearcherPrePass(providerId, currentMessageId) {
         const removedIds = runChatMessages
           .filter((message) => (
             message.id !== currentMessageId &&
-            message.participantId === "coordinator" &&
             message.providerId === providerId &&
-            message.speakerRole === "coordinator" &&
-            message.round === 0
+            isNotionPrepassMessage(message)
           ))
           .map((message) => message.id);
 
@@ -650,8 +902,8 @@ const messageHandlingSource = String.raw`
         } else if (message.type === "continuationPreset") {
           runContinuation = message.payload;
           selectedReviewMode = normalizeReviewMode(runContinuation?.reviewMode);
-          runCoordinatorSelection = runContinuation?.coordinatorProvider || runCoordinatorSelection;
-          runReviewerSelections = [...(runContinuation?.reviewerProviders || [])];
+          runRoleAssignments = buildContinuationRunRoleAssignments(runContinuation, healthyRunProviders());
+          runRoleAdvancedOpen = false;
           runFormState = {
             question: runContinuation?.question || "",
             draft: runContinuation?.draft || "",
@@ -910,7 +1162,7 @@ const markdownSource = String.raw`
 
       function formatChatSubtitle(message) {
         const pieces = [];
-        if (message.speakerRole === "coordinator" && message.round === 0) {
+        if (isNotionPrepassMessage(message)) {
           pieces.push("노션 조사");
         } else if (message.speakerRole) {
           pieces.push(speakerRoleLabel(message.speakerRole));
@@ -1584,8 +1836,6 @@ const pageRendererSource = String.raw`
           ...project.documents.filter((document) => !document.pinnedByDefault)
         ];
         ensureRunFormState(extraDocuments);
-        const selectedCoordinator = runCoordinatorSelection || "";
-        const selectedReviewers = [...runReviewerSelections];
         const formState = runFormState || {
           question: "",
           draft: "",
@@ -1597,12 +1847,155 @@ const pageRendererSource = String.raw`
         const continuationDisabledAttr = appState?.busyMessage || appState.runState?.status !== "idle" ? "disabled" : "";
         const healthyProviderIds = new Set(healthyProviders.map((provider) => provider.providerId));
         const runSetupOpen = isCollapsibleOpen("runSetup");
+        const defaultAssignments = defaultRunRoleAssignments(healthyProviders);
+        const defaultAssignmentsByKey = new Map(defaultAssignments.map((assignment) => [assignment.roleKey, assignment]));
+        const roleAssignmentsByKey = new Map(runRoleAssignments.map((assignment) => [assignment.roleKey, assignment]));
+        const overrideCount = runRoleAssignments.filter((assignment) => !assignment.useProviderDefaults).length;
+        const roleGroups = runRoleGroupOrder.map((groupKey) => ({
+          key: groupKey,
+          label: runRoleGroupLabels[groupKey] || groupKey,
+          roles: runRoleDefinitions.filter((role) => role.groupKey === groupKey)
+        }));
         const canRunReview =
           appState.runState?.status === "idle" &&
-          Boolean(selectedCoordinator) &&
-          healthyProviderIds.has(selectedCoordinator) &&
-          selectedReviewers.length >= 1 &&
-          selectedReviewers.every((providerId) => healthyProviderIds.has(providerId));
+          runRoleAssignments.length === runRoleOrder.length &&
+          runRoleAssignments.every((assignment) => Boolean(assignment.providerId) && healthyProviderIds.has(assignment.providerId));
+
+        function renderProviderOptions(selectedProviderId) {
+          return healthyProviders.length === 0
+            ? '<option value="">정상 도구가 없습니다</option>'
+            : healthyProviders.map((provider) => \`
+              <option value="\${provider.providerId}" \${selectedProviderId === provider.providerId ? "selected" : ""}>\${escapeHtml(providerLabels[provider.providerId] || provider.providerId)}</option>
+            \`).join("");
+        }
+
+        function renderModelOptions(roleAssignment, provider) {
+          const modelOptions = provider?.capabilities?.modelOptions || [];
+          const currentValue = roleAssignment?.modelOverride || "";
+          const optionValues = new Set(modelOptions.map((option) => option.value));
+          return [
+            \`<option value="" \${currentValue ? "" : "selected"}>기본값 상속</option>\`,
+            currentValue && !optionValues.has(currentValue)
+              ? \`<option value="\${escapeHtml(currentValue)}" selected>\${escapeHtml(currentValue)}</option>\`
+              : "",
+            ...modelOptions.map((option) => \`
+              <option value="\${escapeHtml(option.value)}" \${currentValue === option.value ? "selected" : ""}>\${escapeHtml(option.label)}</option>
+            \`)
+          ].join("");
+        }
+
+        function renderEffortOptions(roleAssignment, provider) {
+          const currentValue = roleAssignment?.effortOverride || "";
+          const supportsEffort = Boolean(provider?.capabilities?.supportsEffort);
+          return supportsEffort
+            ? [
+              \`<option value="" \${currentValue ? "" : "selected"}>기본값 상속</option>\`,
+              ...(provider?.capabilities?.effortOptions || []).map((option) => \`
+                <option value="\${escapeHtml(option.value)}" \${currentValue === option.value ? "selected" : ""}>\${escapeHtml(option.label)}</option>
+              \`)
+            ].join("")
+            : '<option value="">지원 안 함</option>';
+        }
+
+        function renderRoleSummary(roleAssignment) {
+          if (!roleAssignment) {
+            return "";
+          }
+
+          const providerSummary = roleAssignmentStatusLabel(roleAssignment);
+          const overrideSummary = roleOverrideSummary(roleAssignment);
+          return \`
+            <div class="row role-summary">
+              <span class="chip">\${escapeHtml(providerSummary)}</span>
+              <span class="chip">\${escapeHtml(overrideSummary)}</span>
+            </div>
+          \`;
+        }
+
+        function renderRoleAssignmentRow(role) {
+          const assignment = roleAssignmentsByKey.get(role.roleKey) || defaultAssignmentsByKey.get(role.roleKey) || {
+            roleKey: role.roleKey,
+            providerId: "",
+            modelOverride: "",
+            effortOverride: "",
+            useProviderDefaults: true
+          };
+          const provider = (appState.providers || []).find((item) => item.providerId === assignment.providerId);
+          const providerSelectDisabled = healthyProviders.length === 0 || appState.runState?.status !== "idle";
+          return \`
+            <div class="role-row">
+              <div class="row space role-row-header">
+                <div class="stack" style="gap:4px;">
+                  <strong>\${escapeHtml(role.label)}</strong>
+                  <div class="muted small">\${escapeHtml(role.description)}</div>
+                </div>
+                \${renderRoleSummary(assignment)}
+              </div>
+              <label class="participant-field role-provider-field">
+                담당 provider
+                <select class="participant-select role-provider-select" data-action="set-run-role-provider" data-role-key="\${role.roleKey}" \${providerSelectDisabled ? "disabled" : ""}>
+                  \${renderProviderOptions(assignment.providerId)}
+                </select>
+              </label>
+              <div class="muted small">현재 선택: \${escapeHtml(providerLabel(assignment.providerId))}\${provider ? \` · \${escapeHtml(providerConfiguredModelLabel(provider.providerId) || "기본 설정")}\` : ""}</div>
+            </div>
+          \`;
+        }
+
+        function renderRoleOverrideRow(role) {
+          const assignment = roleAssignmentsByKey.get(role.roleKey) || defaultAssignmentsByKey.get(role.roleKey) || {
+            roleKey: role.roleKey,
+            providerId: "",
+            modelOverride: "",
+            effortOverride: "",
+            useProviderDefaults: true
+          };
+          const provider = (appState.providers || []).find((item) => item.providerId === assignment.providerId);
+          const supportsEffort = Boolean(provider?.capabilities?.supportsEffort);
+          const providerSelectDisabled = healthyProviders.length === 0 || appState.runState?.status !== "idle";
+          return \`
+            <div class="role-override-row">
+              <div class="row space role-override-header">
+                <div class="stack" style="gap:4px;">
+                  <strong>\${escapeHtml(role.label)}</strong>
+                  <div class="muted small">\${escapeHtml(role.description)}</div>
+                </div>
+                <label class="toggle-pill">
+                  <input
+                    type="checkbox"
+                    data-action="toggle-run-role-defaults"
+                    data-role-key="\${role.roleKey}"
+                    \${assignment.useProviderDefaults ? "checked" : ""}
+                  />
+                  <span>기본값 상속</span>
+                </label>
+              </div>
+              <div class="settings-grid role-override-grid">
+                <label>
+                  모델 override
+                  <select
+                    data-action="set-run-role-model"
+                    data-role-key="\${role.roleKey}"
+                    \${assignment.useProviderDefaults || providerSelectDisabled ? "disabled" : ""}
+                  >
+                    \${renderModelOptions(assignment, provider)}
+                  </select>
+                </label>
+                <label>
+                  effort override
+                  <select
+                    data-action="set-run-role-effort"
+                    data-role-key="\${role.roleKey}"
+                    \${assignment.useProviderDefaults || providerSelectDisabled || !supportsEffort ? "disabled" : ""}
+                  >
+                    \${renderEffortOptions(assignment, provider)}
+                  </select>
+                </label>
+              </div>
+              <div class="muted small">\${assignment.useProviderDefaults ? "선택한 provider의 기본 모델과 effort을 그대로 사용합니다." : "이 역할만 별도 override가 적용됩니다."}\${supportsEffort ? "" : " 이 provider는 effort override를 지원하지 않습니다."}</div>
+            </div>
+          \`;
+        }
 
         return \`
           <div class="stack">
@@ -1616,19 +2009,19 @@ const pageRendererSource = String.raw`
                   \`).join("")}
                 </select>
               </label>
-              <div class="muted small">현재 프로젝트: \${escapeHtml(project.record.companyName)}. 코디네이터는 정확히 1명, 리뷰어는 최소 1명 선택해야 합니다. 현재 정상 도구: \${healthyProviders.map((provider) => provider.providerId).join(", ") || "없음"}.</div>
+              <div class="muted small">현재 프로젝트: \${escapeHtml(project.record.companyName)}. 역할 배치는 7개 top-level 역할로 구성되며, 각 역할은 정상 상태의 provider를 하나씩 선택해야 합니다. 현재 정상 도구: \${healthyProviders.map((provider) => provider.providerId).join(", ") || "없음"}.</div>
             </div>
 
             <section class="card run-setup-card collapsible-shell \${runSetupOpen ? "open" : ""}">
               <button class="run-setup-summary collapsible-toggle" type="button" data-action="toggle-collapsible" data-key="runSetup" aria-expanded="\${runSetupOpen ? "true" : "false"}">
                 <div class="stack" style="gap:4px;">
                   <strong>실행 설정</strong>
-                  <div class="muted small">\${runSetupOpen ? "다음 실행에 쓸 질문, 컨텍스트, 참여자를 설정하세요." : "다음 실행에 쓸 질문, 컨텍스트, 참여자를 펼쳐서 수정하세요."}</div>
+                  <div class="muted small">\${runSetupOpen ? "다음 실행에 쓸 질문, 컨텍스트, 역할 배치를 설정하세요." : "다음 실행에 쓸 질문, 컨텍스트, 역할 배치를 펼쳐서 수정하세요."}</div>
                 </div>
                 <div class="row run-setup-summary-meta">
                   <span class="chip">\${escapeHtml(reviewModeLabel(activeReviewMode))}</span>
-                  <span class="chip">\${escapeHtml(selectedCoordinator || "코디네이터 없음")}</span>
-                  <span class="chip">\${escapeHtml(reviewerCountLabel(selectedReviewers.length))}</span>
+                  <span class="chip">\${escapeHtml(roleCountLabel(runRoleAssignments.length || runRoleOrder.length))}</span>
+                  <span class="chip">\${escapeHtml(overrideCount > 0 ? \`오버라이드 \${overrideCount}개\` : "기본값 상속")}</span>
                   <span class="project-fold-chevron collapsible-chevron" aria-hidden="true">⌄</span>
                 </div>
               </button>
@@ -1660,43 +2053,40 @@ const pageRendererSource = String.raw`
                 : "심화 피드백은 현재 방식 그대로 각 사이클마다 요약, 개선안, 수정 초안을 갱신합니다. Enter로 계속하고 <code>/done</code>으로 종료할 수 있습니다."}</div>
               \${appState.runState?.status !== "idle" ? \`<div class="muted small">진행 중인 실행: \${escapeHtml(appState.runState.message || appState.runState.status)}</div>\` : ""}
               <div class="stack">
-                <strong>참여자</strong>
-                <label class="participant-field">
-                  코디네이터
-                  <select class="participant-select" id="run-coordinator" data-action="set-run-coordinator" \${healthyProviders.length === 0 ? "disabled" : ""}>
-                    \${healthyProviders.length === 0
-                      ? '<option value="">정상 도구가 없습니다</option>'
-                      : healthyProviders.map((provider) => \`
-                        <option value="\${provider.providerId}" \${selectedCoordinator === provider.providerId ? "selected" : ""}>\${escapeHtml(providerLabels[provider.providerId] || provider.providerId)}</option>
-                      \`).join("")}
-                  </select>
-                </label>
-                <div class="stack reviewer-list">
-                  <div class="row space">
-                    <strong>리뷰어</strong>
-                    <button class="button secondary" type="button" data-action="add-reviewer-row" \${healthyProviders.length === 0 || appState.runState?.status !== "idle" ? "disabled" : ""}>리뷰어 추가</button>
-                  </div>
-                  \${selectedReviewers.length === 0 ? '<div class="muted small">리뷰어를 1명 이상 추가하세요.</div>' : selectedReviewers.map((providerId, index) => \`
-                    <div class="reviewer-row">
-                      <span class="reviewer-slot-label">리뷰어 \${index + 1}</span>
-                      <select class="participant-select" data-action="set-run-reviewer" data-index="\${index}" \${healthyProviders.length === 0 ? "disabled" : ""}>
-                        \${healthyProviders.map((provider) => \`
-                          <option value="\${provider.providerId}" \${providerId === provider.providerId ? "selected" : ""}>\${escapeHtml(providerLabels[provider.providerId] || provider.providerId)}</option>
-                        \`).join("")}
-                      </select>
-                      <button
-                        class="button secondary reviewer-remove-button"
-                        type="button"
-                        data-action="remove-reviewer-row"
-                        data-index="\${index}"
-                        title="리뷰어 제거"
-                        aria-label="리뷰어 제거"
-                        \${selectedReviewers.length <= 1 || appState.runState?.status !== "idle" ? "disabled" : ""}>
-                        <span class="reviewer-remove-icon" aria-hidden="true"></span>
-                      </button>
-                    </div>
-                  \`).join("")}
+                <div class="row space">
+                  <strong>역할 배치</strong>
+                  <button
+                    class="button secondary role-advanced-toggle"
+                    type="button"
+                    data-action="toggle-run-role-advanced"
+                    aria-expanded="\${runRoleAdvancedOpen ? "true" : "false"}">
+                    \${runRoleAdvancedOpen ? "고급 옵션 닫기" : "고급 옵션 열기"}
+                  </button>
                 </div>
+                <div class="muted small">기본 화면에서는 7개 top-level 역할의 provider를 배치하고, 모델/effort override는 고급 옵션에서만 조정합니다.</div>
+                \${roleGroups.map((group) => \`
+                  <section class="role-group">
+                    <div class="row space role-group-header">
+                      <div class="stack" style="gap:4px;">
+                        <strong>\${escapeHtml(group.label)}</strong>
+                        <div class="muted small">\${escapeHtml(group.key === "research" ? "문항과 맥락을 조사합니다." : group.key === "drafting" ? "초안과 최종본을 조율합니다." : "검토와 보완 기준을 확인합니다.")}</div>
+                      </div>
+                      <span class="chip">\${escapeHtml(\`\${group.roles.length}개 역할\`)}</span>
+                    </div>
+                    <div class="stack">\${group.roles.map((role) => renderRoleAssignmentRow(role)).join("")}</div>
+                  </section>
+                \`).join("")}
+                \${runRoleAdvancedOpen ? \`
+                  <div class="role-advanced-panel">
+                    <div class="row space">
+                      <strong>고급 옵션</strong>
+                      <span class="chip">\${escapeHtml(\`override 대상 \${overrideCount}개\`)}</span>
+                    </div>
+                    <div class="muted small">각 역할에 대해 provider 기본값을 유지할지, 아니면 모델과 effort를 별도로 override할지 지정합니다.</div>
+                    <div class="stack">\${runRoleDefinitions.map((role) => renderRoleOverrideRow(role)).join("")}</div>
+                  </div>
+                \` : ""}
+              </div>
               </div>
               <div class="stack">
                 <strong>이번 실행에 추가할 문서</strong>
@@ -1743,8 +2133,8 @@ const pageRendererSource = String.raw`
               </div>
               <div class="conversation-meta">
                 \${conversationChip(\`모드: \${reviewModeLabel(activeReviewMode)}\`)}
-                \${conversationChip(\`코디네이터: \${selectedCoordinator || "없음"}\`)}
-                \${conversationChip(\`리뷰어: \${selectedReviewers.length}명\`)}
+                \${conversationChip(\`역할: \${runRoleAssignments.length || runRoleOrder.length}개\`)}
+                \${conversationChip(\`오버라이드: \${overrideCount}개\`)}
                 \${conversationChip(\`정상 도구: \${healthyProviders.length}\`)}
                 \${conversationChip("개입: 자동 일시정지")}
                 \${conversationChip("마크다운: 완료")}
@@ -1788,6 +2178,7 @@ const pageRendererSource = String.raw`
                       \${run.artifacts.summary ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="summary.md">요약 열기</button>\` : ""}
                       \${run.artifacts.improvementPlan ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="improvement-plan.md">개선안 열기</button>\` : ""}
                       \${run.artifacts.revisedDraft ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="revised-draft.md">\${escapeHtml(revisedDraftButtonLabel(run.record))}</button>\` : ""}
+                      \${run.artifacts.finalChecks ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="final-checks.md">최종 점검 열기</button>\` : ""}
                       \${run.artifacts.discussionLedger ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="discussion-ledger.md">토론 상태 열기</button>\` : ""}
                       \${run.artifacts.notionBrief ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="notion-brief.md">노션 브리프 열기</button>\` : ""}
                       \${run.artifacts.chatMessages ? \`<button class="button secondary" data-action="open-artifact" data-project-slug="\${project.record.slug}" data-run-id="\${run.record.id}" data-file-name="chat-messages.json">채팅 메시지 열기</button>\` : ""}
@@ -2047,21 +2438,8 @@ const domEventSource = String.raw`
           submitRunForm();
           return;
         }
-        if (action === "add-reviewer-row") {
-          const fallbackProvider = healthyRunProviders()[0]?.providerId || "";
-          if (!fallbackProvider) {
-            return;
-          }
-          runReviewerSelections = [...runReviewerSelections, fallbackProvider];
-          rerenderView();
-          return;
-        }
-        if (action === "remove-reviewer-row") {
-          const index = Number(target.dataset.index);
-          if (!Number.isInteger(index) || runReviewerSelections.length <= 1) {
-            return;
-          }
-          runReviewerSelections = runReviewerSelections.filter((_, itemIndex) => itemIndex !== index);
+        if (action === "toggle-run-role-advanced") {
+          runRoleAdvancedOpen = !runRoleAdvancedOpen;
           rerenderView();
           return;
         }
@@ -2103,6 +2481,8 @@ const domEventSource = String.raw`
         }
         if (action === "clear-run-continuation") {
           runContinuation = null;
+          runRoleAssignments = [];
+          syncRunProviderSelections(healthyRunProviders());
           rerenderView();
           return;
         }
@@ -2169,17 +2549,53 @@ const domEventSource = String.raw`
           rerenderView();
           return;
         }
-        if (action === "set-run-coordinator") {
-          runCoordinatorSelection = target.value || null;
+        if (action === "set-run-role-provider") {
+          const roleKey = target.dataset.roleKey;
+          if (!roleKey) {
+            return;
+          }
+          updateRunRoleAssignment(roleKey, {
+            providerId: target.value || ""
+          });
           rerenderView();
           return;
         }
-        if (action === "set-run-reviewer") {
-          const index = Number(target.dataset.index);
-          if (!Number.isInteger(index)) {
+        if (action === "toggle-run-role-defaults") {
+          const roleKey = target.dataset.roleKey;
+          if (!roleKey) {
             return;
           }
-          runReviewerSelections[index] = target.value;
+          updateRunRoleAssignment(roleKey, {
+            useProviderDefaults: target.checked
+          });
+          rerenderView();
+          return;
+        }
+        if (action === "set-run-role-model") {
+          const roleKey = target.dataset.roleKey;
+          if (!roleKey) {
+            return;
+          }
+          const currentAssignment = runRoleAssignmentByKey(roleKey);
+          const nextModelOverride = target.value || "";
+          updateRunRoleAssignment(roleKey, {
+            modelOverride: nextModelOverride,
+            useProviderDefaults: !(nextModelOverride || currentAssignment?.effortOverride)
+          });
+          rerenderView();
+          return;
+        }
+        if (action === "set-run-role-effort") {
+          const roleKey = target.dataset.roleKey;
+          if (!roleKey) {
+            return;
+          }
+          const currentAssignment = runRoleAssignmentByKey(roleKey);
+          const nextEffortOverride = target.value || "";
+          updateRunRoleAssignment(roleKey, {
+            effortOverride: nextEffortOverride,
+            useProviderDefaults: !(currentAssignment?.modelOverride || nextEffortOverride)
+          });
           rerenderView();
           return;
         }
@@ -2372,30 +2788,24 @@ const domEventSource = String.raw`
           return;
         }
 
-        const healthyIds = new Set(healthyRunProviders().map((provider) => provider.providerId));
-        const coordinatorProvider = document.getElementById("run-coordinator")?.value || runCoordinatorSelection || "";
-        const reviewerProviders = [...document.querySelectorAll('select[data-action="set-run-reviewer"]')]
-          .map((input) => input.value)
-          .filter(Boolean);
-        if (!coordinatorProvider || !healthyIds.has(coordinatorProvider)) {
-          pushBanner({ kind: "error", message: "정상 상태의 코디네이터를 1명 선택하세요." });
-          renderBanner();
-          return;
-        }
-        if (reviewerProviders.length < 1) {
-          pushBanner({ kind: "error", message: "정상 상태의 리뷰어를 1명 이상 추가하세요." });
-          renderBanner();
-          return;
-        }
-        if (reviewerProviders.some((providerId) => !healthyIds.has(providerId))) {
-          pushBanner({ kind: "error", message: "모든 리뷰어는 정상 상태의 도구를 사용해야 합니다." });
+        const healthyProviders = healthyRunProviders();
+        syncRunProviderSelections(healthyProviders);
+        const healthyIds = new Set(healthyProviders.map((provider) => provider.providerId));
+        const roleAssignments = runRoleOrder.map((roleKey) => runRoleAssignmentByKey(roleKey) || defaultRunRoleAssignments(healthyProviders).find((assignment) => assignment.roleKey === roleKey));
+        const missingRole = roleAssignments.find((assignment) => !assignment?.providerId || !healthyIds.has(assignment.providerId));
+        if (missingRole) {
+          pushBanner({ kind: "error", message: "7개 역할 모두 정상 상태의 provider를 1명씩 선택하세요." });
           renderBanner();
           return;
         }
 
+        const coordinatorProvider = runRoleAssignmentByKey("section_coordinator")?.providerId || "";
+        const reviewerProviders = runReviewerRoleKeys
+          .map((roleKey) => runRoleAssignmentByKey(roleKey)?.providerId || "")
+          .filter(Boolean);
+
         rememberCurrentTabScroll();
-        runCoordinatorSelection = coordinatorProvider;
-        runReviewerSelections = reviewerProviders;
+        syncLegacyRunSelectionsFromRoles();
         setCollapsibleOpen("runSetup", false);
 
         runLog = [];
@@ -2425,6 +2835,22 @@ const domEventSource = String.raw`
           rounds: 1,
           coordinatorProvider,
           reviewerProviders,
+          roleAssignments: runRoleOrder.map((roleKey) => {
+            const assignment = runRoleAssignmentByKey(roleKey) || defaultRunRoleAssignments(healthyProviders).find((item) => item.roleKey === roleKey) || {
+              roleKey,
+              providerId: "",
+              modelOverride: "",
+              effortOverride: "",
+              useProviderDefaults: true
+            };
+            return {
+              role: assignment.roleKey,
+              providerId: assignment.providerId,
+              modelOverride: assignment.useProviderDefaults ? "" : (assignment.modelOverride || ""),
+              effortOverride: assignment.useProviderDefaults ? "" : (assignment.effortOverride || ""),
+              useProviderDefaults: Boolean(assignment.useProviderDefaults)
+            };
+          }),
           selectedDocumentIds: [...(runFormState?.selectedDocumentIds || [])]
         });
       }

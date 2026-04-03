@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import test from "node:test";
-import { DiscussionLedgerSchema } from "../core/schemas";
+import { DiscussionLedgerSchema, RunRecordSchema } from "../core/schemas";
 import { ExtensionToWebviewMessageSchema, WebviewToExtensionMessageSchema } from "../core/webviewProtocol";
 
 test("webview message schema rejects invalid payloads", () => {
@@ -35,6 +35,20 @@ test("webview message schema accepts review mode on run and continuation payload
     question: "question",
     draft: "draft",
     reviewMode: "realtime",
+    roleAssignments: [
+      {
+        role: "section_coordinator",
+        providerId: "claude",
+        useProviderDefaults: true
+      },
+      {
+        role: "section_drafter",
+        providerId: "codex",
+        useProviderDefaults: false,
+        modelOverride: "gpt-5.4",
+        effortOverride: "medium"
+      }
+    ],
     coordinatorProvider: "claude",
     reviewerProviders: ["codex", "codex"],
     rounds: 1,
@@ -44,6 +58,8 @@ test("webview message schema accepts review mode on run and continuation payload
   assert.equal(runMessage.type, "runReview");
   assert.equal(runMessage.reviewMode, "realtime");
   assert.deepEqual(runMessage.reviewerProviders, ["codex", "codex"]);
+  assert.equal(runMessage.roleAssignments?.length, 2);
+  assert.equal(runMessage.roleAssignments?.[1]?.modelOverride, "gpt-5.4");
 
   const continuationMessage = ExtensionToWebviewMessageSchema.parse({
     type: "continuationPreset",
@@ -54,6 +70,13 @@ test("webview message schema accepts review mode on run and continuation payload
       draft: "draft",
       reviewMode: "deepFeedback",
       notionRequest: "",
+      roleAssignments: [
+        {
+          role: "fit_reviewer",
+          providerId: "gemini",
+          useProviderDefaults: true
+        }
+      ],
       coordinatorProvider: "claude",
       reviewerProviders: ["codex", "gemini"],
       selectedDocumentIds: []
@@ -62,6 +85,7 @@ test("webview message schema accepts review mode on run and continuation payload
 
   assert.equal(continuationMessage.type, "continuationPreset");
   assert.equal(continuationMessage.payload.reviewMode, "deepFeedback");
+  assert.equal(continuationMessage.payload.roleAssignments?.[0]?.role, "fit_reviewer");
 
   const continueMessage = WebviewToExtensionMessageSchema.parse({
     type: "continueRunDiscussion",
@@ -72,6 +96,46 @@ test("webview message schema accepts review mode on run and continuation payload
 
   assert.equal(continueMessage.type, "continueRunDiscussion");
   assert.equal(continueMessage.runId, "run-1");
+});
+
+test("run record schema accepts legacy and role-based run payloads", () => {
+  const legacyRecord = RunRecordSchema.parse({
+    id: "run-legacy",
+    projectSlug: "alpha",
+    question: "question",
+    draft: "draft",
+    reviewMode: "deepFeedback",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex"],
+    rounds: 1,
+    selectedDocumentIds: [],
+    status: "completed",
+    startedAt: "2026-04-02T00:00:00.000Z"
+  });
+
+  assert.equal(legacyRecord.id, "run-legacy");
+  assert.equal(legacyRecord.roleAssignments, undefined);
+
+  const roleBasedRecord = RunRecordSchema.parse({
+    ...legacyRecord,
+    id: "run-role-based",
+    roleAssignments: [
+      {
+        role: "section_coordinator",
+        providerId: "claude"
+      },
+      {
+        role: "section_drafter",
+        providerId: "codex",
+        useProviderDefaults: false,
+        modelOverride: "gpt-5.4"
+      }
+    ]
+  });
+
+  assert.equal(roleBasedRecord.roleAssignments?.length, 2);
+  assert.equal(roleBasedRecord.roleAssignments?.[0]?.useProviderDefaults, true);
+  assert.equal(roleBasedRecord.roleAssignments?.[1]?.modelOverride, "gpt-5.4");
 });
 
 test("extension message schema accepts discussion ledger events and artifact flags", () => {
@@ -202,6 +266,7 @@ test("extension message schema accepts discussion ledger events and artifact fla
                 summary: false,
                 improvementPlan: false,
                 revisedDraft: true,
+                finalChecks: true,
                 discussionLedger: true,
                 promptMetrics: false,
                 notionBrief: false,
@@ -219,6 +284,7 @@ test("extension message schema accepts discussion ledger events and artifact fla
   });
 
   assert.equal(stateMessage.type, "state");
+  assert.equal(stateMessage.payload.projects[0]?.runs[0]?.artifacts.finalChecks, true);
   assert.equal(stateMessage.payload.projects[0]?.runs[0]?.artifacts.discussionLedger, true);
 });
 

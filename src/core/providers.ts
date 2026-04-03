@@ -152,8 +152,8 @@ export class ProviderRegistry {
     }
 
     const args = buildProviderArgs(providerId, prompt, testOnly, {
-      model: this.getModel(providerId),
-      effort: this.getEffort(providerId)
+      model: normalizeProviderSettingValue(options.modelOverride) ?? this.getModel(providerId),
+      effort: normalizeProviderSettingValue(options.effortOverride) ?? this.getEffort(providerId)
     });
     const env = buildEnvironment(providerId, authMode, apiKey, command);
     const result = await runProcess(

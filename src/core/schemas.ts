@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   authModes,
+  essayRoleIds,
   compileContextProfiles,
   extractionStatuses,
   providerAuthStatuses,
@@ -10,7 +11,7 @@ import {
   sourceTypes
 } from "./types";
 
-const reviewRoles = ["reviewer", "coordinator"] as const;
+const reviewRoles = ["reviewer", "coordinator", "researcher", "drafter", "finalizer"] as const;
 const runEventTypes = [
   "run-started",
   "compiled-context",
@@ -39,10 +40,19 @@ export const ExtractionStatusSchema = z.enum(extractionStatuses);
 export const RunStatusSchema = z.enum(runStatuses);
 export const ReviewModeSchema = z.enum(reviewModes);
 export const CompileContextProfileSchema = z.enum(compileContextProfiles);
+export const EssayRoleIdSchema = z.enum(essayRoleIds);
 export const ChallengeSeveritySchema = z.enum(["blocking", "advisory"] as const);
 export const ChallengeStatusSchema = z.enum(["open", "deferred", "closed"] as const);
 export const ChallengeSourceSchema = z.enum(["coordinator", "reviewer", "user", "system"] as const);
 export const SectionOutcomeSchema = z.enum(["keep-open", "close-section", "handoff-next-section", "write-final"] as const);
+export const RoleAssignmentSchema = z.object({
+  role: EssayRoleIdSchema,
+  providerId: ProviderIdSchema,
+  useProviderDefaults: z.boolean().default(true),
+  modelOverride: z.string().optional(),
+  effortOverride: z.string().optional()
+});
+export const RoleAssignmentsSchema = z.array(RoleAssignmentSchema);
 export const ChallengeTicketSchema = z.object({
   id: z.string(),
   text: z.string(),
@@ -60,6 +70,15 @@ export const ChallengeTicketSchema = z.object({
 export const DiscussionLedgerSchema = z.object({
   currentFocus: z.string(),
   miniDraft: z.string(),
+  rewriteDirection: z.string().optional(),
+  currentObjective: z.string().optional(),
+  mustKeep: z.array(z.string()).optional(),
+  mustResolve: z.array(z.string()).optional(),
+  availableEvidence: z.array(z.string()).optional(),
+  exitCriteria: z.array(z.string()).optional(),
+  nextOwner: EssayRoleIdSchema.optional(),
+  sectionDraft: z.string().optional(),
+  changeRationale: z.string().optional(),
   acceptedDecisions: z.array(z.string()),
   openChallenges: z.array(z.string()),
   deferredChallenges: z.array(z.string()),
@@ -159,6 +178,7 @@ export const RunRecordSchema = z.object({
   notionBrief: z.string().optional(),
   continuationFromRunId: z.string().optional(),
   continuationNote: z.string().optional(),
+  roleAssignments: RoleAssignmentsSchema.optional(),
   coordinatorProvider: ProviderIdSchema,
   reviewerProviders: z.array(ProviderIdSchema),
   rounds: z.number().int().min(0),

@@ -3,6 +3,7 @@ import { ZodError } from "zod";
 import { ContextCompiler } from "../core/contextCompiler";
 import { ReviewOrchestrator } from "../core/orchestrator";
 import { ProviderRegistry } from "../core/providers";
+import { deriveLegacyParticipantsFromRoles, resolveRoleAssignments } from "../core/roleAssignments";
 import { ForJobStorage } from "../core/storage";
 import {
   ContinuationPreset,
@@ -412,6 +413,16 @@ export class ForJobController {
     await this.pushState();
 
     try {
+      const resolvedRoles = resolveRoleAssignments(
+        message.roleAssignments,
+        message.coordinatorProvider,
+        message.reviewerProviders
+      );
+      const legacyParticipants = deriveLegacyParticipantsFromRoles(
+        resolvedRoles.all,
+        message.coordinatorProvider,
+        message.reviewerProviders
+      );
       await this.requireOrchestrator().run(
         {
           projectSlug: message.projectSlug,
@@ -421,8 +432,9 @@ export class ForJobController {
           notionRequest: message.notionRequest,
           continuationFromRunId: message.continuationFromRunId,
           continuationNote: message.continuationNote,
-          coordinatorProvider: message.coordinatorProvider,
-          reviewerProviders: message.reviewerProviders,
+          roleAssignments: resolvedRoles.all,
+          coordinatorProvider: legacyParticipants.coordinatorProvider,
+          reviewerProviders: legacyParticipants.reviewerProviders,
           rounds: message.rounds,
           selectedDocumentIds: message.selectedDocumentIds,
           charLimit: message.charLimit
@@ -483,6 +495,16 @@ export class ForJobController {
 
   private async loadRunContinuation(projectSlug: string, runId: string): Promise<void> {
     const continuation = await this.requireStorage().loadRunContinuationContext(projectSlug, runId);
+    const resolvedRoles = resolveRoleAssignments(
+      continuation.record.roleAssignments,
+      continuation.record.coordinatorProvider,
+      continuation.record.reviewerProviders
+    );
+    const legacyParticipants = deriveLegacyParticipantsFromRoles(
+      resolvedRoles.all,
+      continuation.record.coordinatorProvider,
+      continuation.record.reviewerProviders
+    );
     const preset: ContinuationPreset = {
       projectSlug,
       runId: continuation.record.id,
@@ -490,8 +512,9 @@ export class ForJobController {
       draft: continuation.revisedDraft?.trim() || continuation.record.draft,
       reviewMode: continuation.record.reviewMode,
       notionRequest: "",
-      coordinatorProvider: continuation.record.coordinatorProvider,
-      reviewerProviders: continuation.record.reviewerProviders,
+      roleAssignments: resolvedRoles.all,
+      coordinatorProvider: legacyParticipants.coordinatorProvider,
+      reviewerProviders: legacyParticipants.reviewerProviders,
       selectedDocumentIds: continuation.record.selectedDocumentIds
     };
 
@@ -501,6 +524,16 @@ export class ForJobController {
 
   private async startContinuationRun(projectSlug: string, runId: string, continuationNote?: string): Promise<void> {
     const continuation = await this.requireStorage().loadRunContinuationContext(projectSlug, runId);
+    const resolvedRoles = resolveRoleAssignments(
+      continuation.record.roleAssignments,
+      continuation.record.coordinatorProvider,
+      continuation.record.reviewerProviders
+    );
+    const legacyParticipants = deriveLegacyParticipantsFromRoles(
+      resolvedRoles.all,
+      continuation.record.coordinatorProvider,
+      continuation.record.reviewerProviders
+    );
 
     await this.startRun({
       type: "runReview",
@@ -511,8 +544,9 @@ export class ForJobController {
       notionRequest: "",
       continuationFromRunId: continuation.record.id,
       continuationNote: continuationNote?.trim() || "",
-      coordinatorProvider: continuation.record.coordinatorProvider,
-      reviewerProviders: continuation.record.reviewerProviders,
+      roleAssignments: resolvedRoles.all,
+      coordinatorProvider: legacyParticipants.coordinatorProvider,
+      reviewerProviders: legacyParticipants.reviewerProviders,
       rounds: 1,
       selectedDocumentIds: continuation.record.selectedDocumentIds
     });

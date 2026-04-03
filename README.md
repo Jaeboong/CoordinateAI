@@ -124,23 +124,36 @@ npm run setup:providers
 2. 자소서 문항을 입력합니다.
 3. 현재 작성한 초안을 입력합니다.
 4. 필요하면 `Notion request`에 자연어로 참고 요청을 입력합니다.
-5. 사용할 provider를 2개 이상 선택합니다.
-6. 조정자 역할을 맡길 모델을 선택합니다.
-7. 이번 실행에서만 추가로 포함할 문서를 선택합니다.
-8. `Run multi-model review`를 눌러 실행합니다.
+5. `역할 배치`에서 각 top-level 역할에 어떤 provider를 붙일지 정합니다.
+6. 기본값으로는 provider의 전역 `model / effort` 설정을 그대로 상속합니다.
+7. 필요하면 `고급 옵션`에서 역할별 `model / effort override`를 켤 수 있습니다.
+8. 이번 실행에서만 추가로 포함할 문서를 선택합니다.
+9. `실행`을 눌러 시작합니다.
 
-선택 UI는 세로 체크박스 목록 대신 가로형 선택 카드로 표시됩니다.
+기본적으로 노출되는 역할은 다음과 같습니다.
 
-- provider 선택은 건강 상태를 보면서 카드처럼 고를 수 있습니다.
-- 추가 문서 선택도 가로형 카드로 표시되어 긴 목록에서도 덜 답답합니다.
-- 프로젝트 선택도 `Runs` 탭 안에서 바로 바꿀 수 있습니다.
+- `Context Researcher`
+- `Section Coordinator`
+- `Section Drafter`
+- `Fit Reviewer`
+- `Evidence Reviewer`
+- `Voice Reviewer`
+- `Finalizer`
+
+즉 `Runs` 탭은 "이번 실행에서 어떤 AI가 어떤 역할을 맡는가"를 정하고, 각 provider의 기본 모델 선택은 `Providers` 탭에서 관리하는 구조입니다.
+
+`고급 옵션`을 열면 각 역할에 대해 다음 override를 설정할 수 있습니다.
+
+- `Provider 기본 설정 사용`
+- `Model override`
+- `Effort override`
 
 예시:
 
 - `CJ 올리브네트웍스 페이지 가져와서 파악해`
 - `신한은행 관련 노션 자료 찾아서 핵심만 반영해`
 
-`Notion request`를 입력하면 선택된 coordinator provider만 자신의 Notion MCP를 사용해 먼저 `Notion Brief`를 만듭니다. reviewer들은 노션을 직접 탐색하지 않고, coordinator가 만든 brief를 공통 참고자료처럼 받아서 토론합니다.
+`Notion request`를 입력하면 `Context Researcher` 역할에 배치된 provider가 자신의 Notion MCP를 사용해 먼저 `Notion Brief`를 만듭니다. reviewer들은 노션을 직접 탐색하지 않고, researcher가 만든 brief를 공통 참고자료처럼 받아서 토론합니다.
 
 실행 중 화면은 두 영역으로 나뉩니다.
 

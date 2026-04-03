@@ -11,6 +11,7 @@ export const RunArtifactFlagsSchema = z.object({
   summary: z.boolean(),
   improvementPlan: z.boolean(),
   revisedDraft: z.boolean(),
+  finalChecks: z.boolean(),
   discussionLedger: z.boolean(),
   promptMetrics: z.boolean(),
   notionBrief: z.boolean(),

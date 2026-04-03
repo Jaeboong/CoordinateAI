@@ -1,4 +1,5 @@
 import { ContextCompiler } from "./contextCompiler";
+import { resolveRoleAssignments } from "./roleAssignments";
 import { ForJobStorage, RunContinuationContext } from "./storage";
 import {
   ChallengeSeverity,
@@ -7,12 +8,15 @@ import {
   ChallengeTicket,
   CompileContextProfile,
   DiscussionLedger,
+  EssayRoleId,
+  essayRoleIds,
   ProviderId,
   PromptMetrics,
   RunChatMessage,
   ProviderRuntimeState,
   ReviewMode,
   ReviewerPerspective,
+  RoleAssignment,
   ReviewTurn,
   RunArtifacts,
   RunEvent,
@@ -27,6 +31,8 @@ interface ReviewParticipant {
   participantLabel: string;
   providerId: ProviderId;
   role: ReviewTurn["role"];
+  assignment: RoleAssignment;
+  roleId?: EssayRoleId;
   perspective?: ReviewerPerspective;
 }
 
@@ -44,6 +50,8 @@ export interface OrchestratorGateway {
       messageScope?: string;
       participantId?: string;
       participantLabel?: string;
+      modelOverride?: string;
+      effortOverride?: string;
       onEvent?: (event: RunEvent) => Promise<void> | void;
     }
   ): Promise<{ text: string; stdout: string; stderr: string; exitCode: number }>;
@@ -73,6 +81,21 @@ type NotionRequestKind = "explicit" | "implicit" | "auto";
 interface NotionRequestDescriptor {
   text: string;
   kind: NotionRequestKind;
+}
+
+interface SectionBrief {
+  currentSection: string;
+  currentObjective: string;
+  mustKeep: string[];
+  mustResolve: string[];
+  availableEvidence: string[];
+  exitCriteria: string[];
+  nextOwner: string;
+}
+
+interface SectionDraftResult {
+  sectionDraft: string;
+  changeRationale: string;
 }
 
 interface RealtimeReferencePacket {
@@ -122,13 +145,17 @@ export class ReviewOrchestrator {
   ): Promise<{ run: RunRecord; turns: ReviewTurn[]; artifacts: RunArtifacts }> {
     const states = await this.gateway.listRuntimeStates();
     const stateMap = new Map(states.map((state) => [state.providerId, state]));
-    const coordinator = buildCoordinatorParticipant(request.coordinatorProvider);
-    const requestedReviewers = buildReviewerParticipants(request.reviewerProviders);
+    const resolvedRoles = resolveRoleAssignments(request.roleAssignments, request.coordinatorProvider, request.reviewerProviders);
+    const researcher = buildResearchParticipant(resolvedRoles.byRole.context_researcher);
+    const coordinator = buildCoordinatorParticipant(resolvedRoles.byRole.section_coordinator);
+    const drafter = buildDrafterParticipant(resolvedRoles.byRole.section_drafter);
+    const finalizer = buildFinalizerParticipant(resolvedRoles.byRole.finalizer);
+    const requestedReviewers = buildReviewerParticipants(resolvedRoles.byRole);
     if (requestedReviewers.length < 1) {
       throw new Error("At least one reviewer is required to run a review.");
     }
 
-    const selectedProviders = [coordinator.providerId, ...requestedReviewers.map((reviewer) => reviewer.providerId)];
+    const selectedProviders = [...new Set(resolvedRoles.all.map((assignment) => assignment.providerId))];
     const unavailableProviders = [...new Set(selectedProviders.filter((providerId) => stateMap.get(providerId)?.authStatus !== "healthy"))];
     if (unavailableProviders.length > 0) {
       throw new Error(`Selected providers are not healthy: ${unavailableProviders.join(", ")}`);
@@ -171,8 +198,9 @@ export class ReviewOrchestrator {
       draft: request.draft,
       reviewMode: request.reviewMode,
       notionRequest: effectiveNotionRequest,
-      coordinatorProvider: request.coordinatorProvider,
-      reviewerProviders: request.reviewerProviders,
+      roleAssignments: resolvedRoles.all,
+      coordinatorProvider: coordinator.providerId,
+      reviewerProviders: requestedReviewers.map((reviewer) => reviewer.providerId),
       continuationFromRunId: request.continuationFromRunId?.trim() || undefined,
       continuationNote: trimmedContinuationNote,
       rounds: 0,
@@ -182,7 +210,7 @@ export class ReviewOrchestrator {
     };
 
     await this.storage.createRun(run);
-    await this.storage.setLastCoordinatorProvider(request.coordinatorProvider);
+    await this.storage.setLastCoordinatorProvider(coordinator.providerId);
     await this.storage.setLastReviewMode(request.reviewMode);
     await this.storage.saveRunTextArtifact(request.projectSlug, runId, "compiled-context.md", initialContextMarkdown);
     const chatMessages = new Map<string, RunChatMessage>();
@@ -209,6 +237,9 @@ export class ReviewOrchestrator {
       if (!coordinatorState) {
         throw new Error("Coordinator provider is unavailable.");
       }
+      const researcherState = stateMap.get(researcher.providerId);
+      const drafterState = stateMap.get(drafter.providerId);
+      const finalizerState = stateMap.get(finalizer.providerId);
 
       if (effectiveNotionRequest) {
         const notionCompiled = await this.compiler.compile({
@@ -230,10 +261,10 @@ export class ReviewOrchestrator {
         const notionTurn = await this.executeTurn(
           request.projectSlug,
           runId,
-          coordinator,
+          researcher,
           0,
           notionPrompt,
-          coordinatorState,
+          researcherState ?? coordinatorState,
           eventSink
         );
         turns.push(notionTurn);
@@ -277,6 +308,9 @@ export class ReviewOrchestrator {
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "summary.md", artifacts.summary);
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "improvement-plan.md", artifacts.improvementPlan);
         await this.storage.saveRunTextArtifact(request.projectSlug, runId, "revised-draft.md", artifacts.revisedDraft);
+        if (artifacts.finalChecks?.trim()) {
+          await this.storage.saveRunTextArtifact(request.projectSlug, runId, "final-checks.md", artifacts.finalChecks);
+        }
       };
       const buildCompiledContextMarkdown = async (
         draft: string,
@@ -453,6 +487,52 @@ export class ReviewOrchestrator {
         while (true) {
           const compiledContextMarkdown = await buildCompiledContextMarkdown(currentDraft, cycle, "cycle", "full");
           const completedReviewerTurns = turns.filter((turn) => turn.status === "completed" && turn.role === "reviewer");
+          const coordinatorPrompt = buildDeepSectionCoordinatorPrompt(
+            compiledContextMarkdown,
+            getNotionBriefForProfile("full"),
+            userInterventions,
+            latestArtifacts,
+            turns.filter((turn) => turn.status === "completed")
+          );
+          const coordinatorBriefTurn = await this.executeTurn(
+            request.projectSlug,
+            runId,
+            coordinator,
+            cycle,
+            coordinatorPrompt,
+            coordinatorState,
+            eventSink,
+            `deep-cycle-${cycle}-coordinator-brief`
+          );
+          turns.push(coordinatorBriefTurn);
+
+          if (coordinatorBriefTurn.status !== "completed") {
+            throw new Error(coordinatorBriefTurn.error ?? "Coordinator failed to prepare the section brief.");
+          }
+
+          const sectionBrief = splitSectionCoordinationBrief(coordinatorBriefTurn.response);
+          const drafterPrompt = buildSectionDrafterPrompt(
+            compiledContextMarkdown,
+            getNotionBriefForProfile("full"),
+            userInterventions,
+            sectionBrief,
+            latestArtifacts
+          );
+          const drafterTurn = await this.executeTurn(
+            request.projectSlug,
+            runId,
+            drafter,
+            cycle,
+            drafterPrompt,
+            drafterState ?? coordinatorState,
+            eventSink,
+            `deep-cycle-${cycle}-drafter`
+          );
+          turns.push(drafterTurn);
+          if (drafterTurn.status !== "completed") {
+            throw new Error(drafterTurn.error ?? "Section drafter failed to write the section draft.");
+          }
+          const draftOutput = splitSectionDraftOutput(drafterTurn.response, currentDraft);
           const currentCycleReviewerTurns: ReviewTurn[] = [];
 
           for (const reviewer of [...activeReviewers]) {
@@ -461,7 +541,7 @@ export class ReviewOrchestrator {
               continue;
             }
 
-            const prompt = buildReviewerPrompt(
+            const prompt = buildDeepReviewerPrompt(
               compiledContextMarkdown,
               getNotionBriefForProfile("full"),
               completedReviewerTurns,
@@ -469,7 +549,9 @@ export class ReviewOrchestrator {
               reviewer.participantId,
               latestArtifacts,
               userInterventions,
-              reviewer.perspective
+              reviewer.perspective,
+              sectionBrief,
+              draftOutput
             );
             const turn = await this.executeTurn(
               request.projectSlug,
@@ -497,30 +579,65 @@ export class ReviewOrchestrator {
             }
           }
 
-          const coordinatorPrompt = buildCoordinatorPrompt(
+          const coordinatorDecisionPrompt = buildDeepCoordinatorDecisionPrompt(
             compiledContextMarkdown,
             getNotionBriefForProfile("full"),
             userInterventions,
             currentCycleReviewerTurns,
-            latestArtifacts
+            latestArtifacts,
+            sectionBrief,
+            draftOutput
           );
-          const coordinatorTurn = await this.executeTurn(
+          const coordinatorDecisionTurn = await this.executeTurn(
             request.projectSlug,
             runId,
             coordinator,
             cycle,
-            coordinatorPrompt,
+            coordinatorDecisionPrompt,
             coordinatorState,
             eventSink,
-            `deep-cycle-${cycle}-coordinator`
+            `deep-cycle-${cycle}-coordinator-decision`
           );
-          turns.push(coordinatorTurn);
+          turns.push(coordinatorDecisionTurn);
 
-          if (coordinatorTurn.status !== "completed") {
-            throw new Error(coordinatorTurn.error ?? "Coordinator failed to update the session.");
+          if (coordinatorDecisionTurn.status !== "completed") {
+            throw new Error(coordinatorDecisionTurn.error ?? "Coordinator failed to decide the next owner.");
           }
 
-          latestArtifacts = splitCoordinatorSections(coordinatorTurn.response, currentDraft);
+          const coordinatorDecision = splitCoordinatorDecisionOutput(coordinatorDecisionTurn.response);
+          const finalizerPrompt = buildDeepFinalizerPrompt(
+            compiledContextMarkdown,
+            getNotionBriefForProfile("full"),
+            userInterventions,
+            latestArtifacts,
+            sectionBrief,
+            draftOutput,
+            currentCycleReviewerTurns,
+            coordinatorDecision
+          );
+          const finalizerTurn = await this.executeTurn(
+            request.projectSlug,
+            runId,
+            finalizer,
+            cycle,
+            finalizerPrompt,
+            finalizerState ?? coordinatorState,
+            eventSink,
+            `deep-cycle-${cycle}-finalizer`
+          );
+          turns.push(finalizerTurn);
+
+          if (finalizerTurn.status !== "completed") {
+            throw new Error(finalizerTurn.error ?? "Finalizer failed to update the session.");
+          }
+
+          const finalizerOutput = splitFinalizerOutput(finalizerTurn.response, currentDraft);
+          latestArtifacts = {
+            summary: coordinatorDecision.summary,
+            improvementPlan: coordinatorDecision.improvementPlan,
+            revisedDraft: finalizerOutput.finalDraft,
+            finalChecks: finalizerOutput.finalChecks
+          };
           currentDraft = latestArtifacts.revisedDraft;
           await persistTurnsAndChat();
           await saveDeepArtifacts(latestArtifacts);
@@ -546,12 +663,12 @@ export class ReviewOrchestrator {
           });
 
           const intervention = (await requestUserIntervention?.({
-            projectSlug: request.projectSlug,
-            runId,
-            round: cycle,
-            reviewMode: request.reviewMode,
-            coordinatorProvider: request.coordinatorProvider
-          }))?.trim();
+              projectSlug: request.projectSlug,
+              runId,
+              round: cycle,
+              reviewMode: request.reviewMode,
+              coordinatorProvider: coordinator.providerId
+            }))?.trim();
 
           if (intervention?.toLowerCase() === "/done" || intervention?.toLowerCase() === "/stop") {
             await eventSink({
@@ -650,6 +767,49 @@ export class ReviewOrchestrator {
             throw new Error(coordinatorTurn.error ?? "Coordinator failed to guide the realtime discussion.");
           }
           await updateDiscussionLedger(coordinatorTurn, extractDiscussionLedger(coordinatorTurn.response, round));
+          if (discussionLedger) {
+            const drafterPrompt = buildRealtimeSectionDrafterPrompt(
+              compiledContextMarkdown,
+              getNotionBriefForProfile("compact"),
+              userInterventions,
+              turns.filter((turn) => turn.status === "completed"),
+              round,
+              discussionLedger
+            );
+            const drafterTurn = await this.executeTurn(
+              request.projectSlug,
+              runId,
+              drafter,
+              round,
+              drafterPrompt,
+              drafterState ?? coordinatorState,
+              eventSink,
+              `realtime-round-${round}-drafter`
+            );
+            turns.push(drafterTurn);
+            if (drafterTurn.status === "completed") {
+              const sectionDraft = extractSectionDraft(drafterTurn.response);
+              discussionLedger = {
+                ...discussionLedger,
+                miniDraft: sectionDraft?.sectionDraft || discussionLedger.miniDraft,
+                sectionDraft: sectionDraft?.sectionDraft || discussionLedger.sectionDraft,
+                changeRationale: sectionDraft?.changeRationale || discussionLedger.changeRationale,
+                nextOwner: "fit_reviewer",
+                updatedAtRound: round
+              };
+              await eventSink({
+                timestamp: nowIso(),
+                type: "discussion-ledger-updated",
+                providerId: drafter.providerId,
+                participantId: drafter.participantId,
+                participantLabel: drafter.participantLabel,
+                round,
+                speakerRole: drafter.role,
+                message: `Section draft prepared for ${discussionLedger.targetSection}`,
+                discussionLedger
+              });
+            }
+          }
 
           let queuedMessages = consumeCurrentUserMessages();
           if (queuedMessages.length > 0) {
@@ -813,12 +973,12 @@ export class ReviewOrchestrator {
             const finalTurn = await this.executeTurn(
               request.projectSlug,
               runId,
-              coordinator,
+              finalizer,
               round,
               finalPrompt,
-              coordinatorState,
+              finalizerState ?? coordinatorState,
               eventSink,
-              `realtime-round-${round}-coordinator-final`
+              `realtime-round-${round}-finalizer-final`
             );
             turns.push(finalTurn);
 
@@ -878,7 +1038,7 @@ export class ReviewOrchestrator {
               runId,
               round,
               reviewMode: request.reviewMode,
-              coordinatorProvider: request.coordinatorProvider
+              coordinatorProvider: coordinator.providerId
             }))?.trim();
 
             if (intervention?.toLowerCase() === "/done" || intervention?.toLowerCase() === "/stop") {
@@ -1024,6 +1184,8 @@ export class ReviewOrchestrator {
         messageScope: scopedMessageScope,
         participantId: participant.participantId,
         participantLabel: participant.participantLabel,
+        modelOverride: participant.assignment.useProviderDefaults ? undefined : participant.assignment.modelOverride,
+        effortOverride: participant.assignment.useProviderDefaults ? undefined : participant.assignment.effortOverride,
         onEvent
       });
       turn.response = result.text.trim();
@@ -1172,52 +1334,191 @@ function finalizePromptMetrics(prompt: BuiltPrompt): PromptMetrics {
   };
 }
 
-function buildReviewerPrompt(
+interface SectionCoordinationBrief {
+  currentSection: string;
+  currentObjective: string;
+  rewriteDirection: string;
+  mustKeep: string[];
+  mustResolve: string[];
+  availableEvidence: string[];
+  exitCriteria: string[];
+  nextOwner: EssayRoleId;
+}
+
+interface SectionDraftOutput {
+  sectionDraft: string;
+  changeRationale: string;
+}
+
+interface CoordinatorDecisionOutput {
+  summary: string;
+  improvementPlan: string;
+  nextOwner?: EssayRoleId;
+}
+
+interface FinalizerOutput {
+  finalDraft: string;
+  finalChecks?: string;
+}
+
+function normalizeEssayRoleId(raw: string, fallback: EssayRoleId): EssayRoleId {
+  const normalized = normalizeLedgerSingleLine(raw) as EssayRoleId;
+  return essayRoleIds.includes(normalized) ? normalized : fallback;
+}
+
+function splitSectionCoordinationBrief(output: string): SectionCoordinationBrief {
+  const currentSection = normalizeLedgerSingleLine(extractMarkdownSection(output, "Current Section"))
+    || normalizeLedgerSingleLine(extractMarkdownSection(output, "Target Section"))
+    || "핵심 문단";
+  const currentObjective = normalizeLedgerParagraph(extractMarkdownSection(output, "Current Objective"))
+    || normalizeLedgerSingleLine(extractMarkdownSection(output, "Current Focus"))
+    || "현재 section의 설득력을 높일 것";
+  const rewriteDirection = normalizeLedgerParagraph(extractMarkdownSection(output, "Rewrite Direction"))
+    || normalizeLedgerParagraph(extractMarkdownSection(output, "Mini Draft"))
+    || currentObjective;
+
+  return {
+    currentSection,
+    currentObjective,
+    rewriteDirection,
+    mustKeep: parseDiscussionLedgerItems(extractMarkdownSection(output, "Must Keep")),
+    mustResolve: parseDiscussionLedgerItems(extractMarkdownSection(output, "Must Resolve")),
+    availableEvidence: parseDiscussionLedgerItems(extractMarkdownSection(output, "Available Evidence")),
+    exitCriteria: parseDiscussionLedgerItems(extractMarkdownSection(output, "Exit Criteria")),
+    nextOwner: normalizeEssayRoleId(extractMarkdownSection(output, "Next Owner"), "section_drafter")
+  };
+}
+
+function splitSectionDraftOutput(output: string, fallbackDraft: string): SectionDraftOutput {
+  const sectionDraft = normalizeLedgerParagraph(extractMarkdownSection(output, "Section Draft")) || output.trim() || fallbackDraft;
+  const changeRationale = normalizeLedgerParagraph(extractMarkdownSection(output, "Change Rationale"));
+  return {
+    sectionDraft,
+    changeRationale
+  };
+}
+
+function extractSectionDraft(output: string): SectionDraftOutput | undefined {
+  const sectionDraft = normalizeLedgerParagraph(extractMarkdownSection(output, "Section Draft"));
+  if (!sectionDraft) {
+    return undefined;
+  }
+
+  return {
+    sectionDraft,
+    changeRationale: normalizeLedgerParagraph(extractMarkdownSection(output, "Change Rationale"))
+  };
+}
+
+function splitCoordinatorDecisionOutput(output: string): CoordinatorDecisionOutput {
+  return {
+    summary: extractMarkdownSection(output, "Summary") || output.trim(),
+    improvementPlan: extractMarkdownSection(output, "Improvement Plan") || "구조화된 개선안이 반환되지 않았습니다.",
+    nextOwner: normalizeLedgerSingleLine(extractMarkdownSection(output, "Next Owner"))
+      ? normalizeEssayRoleId(extractMarkdownSection(output, "Next Owner"), "finalizer")
+      : undefined
+  };
+}
+
+function splitFinalizerOutput(output: string, fallbackDraft: string): FinalizerOutput {
+  const finalDraft = extractMarkdownSection(output, "Final Draft") || output.trim() || fallbackDraft;
+  const finalChecks = extractMarkdownSection(output, "Final Checks") || undefined;
+  return {
+    finalDraft,
+    finalChecks
+  };
+}
+
+function buildSectionCoordinationBriefBlock(brief: SectionCoordinationBrief, heading = "## Current Section Brief"): string {
+  return [
+    heading,
+    `### Current Section\n${brief.currentSection}`,
+    `### Current Objective\n${brief.currentObjective}`,
+    `### Rewrite Direction\n${brief.rewriteDirection}`,
+    "### Must Keep",
+    ...formatDiscussionLedgerItems(brief.mustKeep),
+    "",
+    "### Must Resolve",
+    ...formatDiscussionLedgerItems(brief.mustResolve),
+    "",
+    "### Available Evidence",
+    ...formatDiscussionLedgerItems(brief.availableEvidence),
+    "",
+    "### Exit Criteria",
+    ...formatDiscussionLedgerItems(brief.exitCriteria),
+    "",
+    `### Next Owner\n${brief.nextOwner}`
+  ].join("\n");
+}
+
+function buildSectionDraftBlock(sectionDraft: string, changeRationale?: string, heading = "## Current Section Draft"): string {
+  return [
+    heading,
+    sectionDraft,
+    changeRationale
+      ? `\n## Change Rationale\n${changeRationale}`
+      : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildReviewerDecisionBlock(turns: ReviewTurn[], heading = "## Reviewer Judgments"): string {
+  if (turns.length === 0) {
+    return `${heading}\n\n_No reviewer judgments yet._`;
+  }
+
+  return [
+    heading,
+    ...turns.map((turn) => `### ${turnLabel(turn)}\n${turn.response}`)
+  ].join("\n\n");
+}
+
+function buildCoordinatorDecisionBlock(decision: CoordinatorDecisionOutput, heading = "## Coordinator Decision"): string {
+  return [
+    heading,
+    `### Summary\n${decision.summary}`,
+    `### Improvement Plan\n${decision.improvementPlan}`,
+    decision.nextOwner ? `### Next Owner\n${decision.nextOwner}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildDeepSectionCoordinatorPrompt(
   contextMarkdown: string,
   notionBrief: string,
-  allTurns: ReviewTurn[],
-  round: number,
-  currentParticipantId: string,
+  userInterventions: Array<{ round: number; text: string }>,
   latestArtifacts?: RunArtifacts,
-  userInterventions: Array<{ round: number; text: string }> = [],
-  perspective?: ReviewerPerspective
+  turns: ReviewTurn[] = []
 ): BuiltPrompt {
-  // 같은 라운드의 다른 리뷰어 응답은 보이지 않게 한다 — 독립 평가 보장
-  const visibleTurns = allTurns.filter((turn) => {
-    if (turn.round === round && turn.role === "reviewer" && turn.participantId !== currentParticipantId) {
-      return false;
-    }
-    return true;
-  });
-
-  const previous = visibleTurns
+  const previous = turns
+    .filter((turn) => turn.status === "completed")
     .map((turn) => `## ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
     .slice(-4)
     .join("\n\n");
-  const perspectiveInstruction = getPerspectiveInstruction(perspective);
   const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
   const guidanceBlock = buildUserGuidanceBlock(userInterventions);
-  const previousBlock = previous ? "## Prior Reviewer Notes\n\n" + previous : "## Prior Reviewer Notes\n\n_No prior reviewer notes yet._";
+  const previousBlock = previous ? "## Recent Cycle History\n\n" + previous : "## Recent Cycle History\n\n_No prior cycle history yet._";
 
   return buildPrompt({
-    promptKind: "deep-reviewer",
+    promptKind: "deep-coordinator",
     contextProfile: "full",
     contextMarkdown,
     notionBrief,
     historyBlocks: [sessionSnapshot, previousBlock],
     sections: [
-    "You are an essay reviewer collaborating with other model reviewers.",
+    "You are the section coordinator for an ongoing multi-model essay feedback session.",
     buildStructuredKoreanResponseInstruction(),
-    perspectiveInstruction,
-    "Focus on improving a job application essay draft.",
-    `Cycle: ${round}`,
+    "Narrow the next revision down to exactly one section-sized objective.",
+    "Do not write the section itself. Planning and scope control only.",
     "Do not search Notion or browse external sources yourself. Use only the provided context and Notion Brief.",
-    "Return Markdown with these sections:",
-    "## Overall Verdict",
-    "## Strengths",
-    "## Problems",
-    "## Suggestions",
-    "## Direct Responses To Other Reviewers",
+    "Return Markdown with exactly these top-level sections:",
+    "## Current Section",
+    "## Current Objective",
+    "## Rewrite Direction",
+    "## Must Keep",
+    "## Must Resolve",
+    "## Available Evidence",
+    "## Exit Criteria",
+    "## Next Owner",
+    "Next Owner should usually be section_drafter unless more research is clearly required.",
     "",
     contextMarkdown,
     "",
@@ -1229,7 +1530,218 @@ function buildReviewerPrompt(
     guidanceBlock ? "" : "",
     previousBlock,
     "",
+    "Keep every field operational and concise. The goal is to help the drafter write the next section revision safely."
+    ]
+  });
+}
+
+function buildSectionDrafterPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  brief: SectionCoordinationBrief,
+  latestArtifacts?: RunArtifacts
+): BuiltPrompt {
+  const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions);
+  const briefBlock = buildSectionCoordinationBriefBlock(brief);
+
+  return buildPrompt({
+    promptKind: "deep-drafter",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, briefBlock],
+    sections: [
+    "You are the section drafter for a multi-model essay writing workflow.",
+    buildStructuredKoreanResponseInstruction(),
+    "Write the actual section text using only the supplied coordination brief and evidence boundaries.",
+    "Do not invent new evidence or broaden attribution beyond what the brief safely allows.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Section Draft",
+    "## Change Rationale",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    sessionSnapshot,
+    sessionSnapshot ? "" : "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    briefBlock,
+    "",
+    "Section Draft should be the prose only for the target section, not the whole essay."
+    ]
+  });
+}
+
+function buildDeepReviewerPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  allTurns: ReviewTurn[],
+  round: number,
+  currentParticipantId: string,
+  latestArtifacts: RunArtifacts | undefined,
+  userInterventions: Array<{ round: number; text: string }>,
+  perspective: ReviewerPerspective | undefined,
+  brief: SectionCoordinationBrief,
+  draftOutput: SectionDraftOutput
+): BuiltPrompt {
+  const visibleTurns = allTurns.filter((turn) => {
+    if (turn.round === round && turn.role === "reviewer" && turn.participantId !== currentParticipantId) {
+      return false;
+    }
+    return true;
+  });
+
+  const previous = visibleTurns
+    .filter((turn) => turn.role === "reviewer")
+    .map((turn) => `## ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
+    .slice(-4)
+    .join("\n\n");
+  const perspectiveInstruction = getPerspectiveInstruction(perspective);
+  const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions);
+  const previousBlock = previous ? "## Prior Reviewer Notes\n\n" + previous : "## Prior Reviewer Notes\n\n_No prior reviewer notes yet._";
+  const briefBlock = buildSectionCoordinationBriefBlock(brief);
+  const draftBlock = buildSectionDraftBlock(draftOutput.sectionDraft, draftOutput.changeRationale);
+
+  return buildPrompt({
+    promptKind: "deep-reviewer",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, briefBlock, draftBlock, previousBlock],
+    sections: [
+    "You are a role-specific reviewer collaborating with other model reviewers.",
+    buildStructuredKoreanResponseInstruction(),
+    perspectiveInstruction,
+    "Review only the current section draft against the coordinator's objective and evidence boundaries.",
+    `Cycle: ${round}`,
+    "Do not search Notion or browse external sources yourself. Use only the provided context and Notion Brief.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Judgment",
+    "## Reason",
+    "## Condition To Close",
+    "## Direct Responses To Other Reviewers",
+    "Judgment must be exactly one of: ACCEPT, ADVISORY, BLOCK.",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    sessionSnapshot,
+    sessionSnapshot ? "" : "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    briefBlock,
+    "",
+    draftBlock,
+    "",
+    previousBlock,
+    "",
     "Prioritize concrete, evidence-based feedback tied to your assigned lens."
+    ]
+  });
+}
+
+function buildDeepCoordinatorDecisionPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  reviewerTurns: ReviewTurn[],
+  latestArtifacts: RunArtifacts | undefined,
+  brief: SectionCoordinationBrief,
+  draftOutput: SectionDraftOutput
+): BuiltPrompt {
+  const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions);
+  const briefBlock = buildSectionCoordinationBriefBlock(brief);
+  const draftBlock = buildSectionDraftBlock(draftOutput.sectionDraft, draftOutput.changeRationale);
+  const reviewerBlock = buildReviewerDecisionBlock(reviewerTurns, "## Reviewer Feedback For This Cycle");
+
+  return buildPrompt({
+    promptKind: "deep-coordinator-decision",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, briefBlock, draftBlock, reviewerBlock],
+    sections: [
+    "You are the section coordinator deciding whether the drafted section is ready to integrate.",
+    buildStructuredKoreanResponseInstruction(),
+    "Do not rewrite the section yourself. Evaluate reviewer judgments and decide the next owner.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Summary",
+    "## Improvement Plan",
+    "## Next Owner",
+    "Next Owner must be exactly one of: section_drafter, context_researcher, finalizer.",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    sessionSnapshot,
+    sessionSnapshot ? "" : "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    briefBlock,
+    "",
+    draftBlock,
+    "",
+    reviewerBlock
+    ]
+  });
+}
+
+function buildDeepFinalizerPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  latestArtifacts: RunArtifacts | undefined,
+  brief: SectionCoordinationBrief,
+  draftOutput: SectionDraftOutput,
+  reviewerTurns: ReviewTurn[],
+  decision: CoordinatorDecisionOutput
+): BuiltPrompt {
+  const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions);
+  const briefBlock = buildSectionCoordinationBriefBlock(brief);
+  const draftBlock = buildSectionDraftBlock(draftOutput.sectionDraft, draftOutput.changeRationale);
+  const reviewerBlock = buildReviewerDecisionBlock(reviewerTurns);
+  const decisionBlock = buildCoordinatorDecisionBlock(decision);
+
+  return buildPrompt({
+    promptKind: "deep-finalizer",
+    contextProfile: "full",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [sessionSnapshot, briefBlock, draftBlock, reviewerBlock, decisionBlock],
+    sections: [
+    "You are the finalizer for a multi-model essay revision workflow.",
+    buildFinalEssayKoreanInstruction(),
+    "Integrate the approved section draft into the full essay while preserving evidence boundaries and reviewer decisions.",
+    "Do not invent new evidence or claims.",
+    "Return Markdown with exactly these top-level sections:",
+    "## Final Draft",
+    "## Final Checks",
+    "Final Checks should be a short bullet list of residual cautions or '- 없음'.",
+    "",
+    contextMarkdown,
+    "",
+    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+    notionBrief ? "" : "",
+    sessionSnapshot,
+    sessionSnapshot ? "" : "",
+    guidanceBlock,
+    guidanceBlock ? "" : "",
+    briefBlock,
+    "",
+    draftBlock,
+    "",
+    reviewerBlock,
+    "",
+    decisionBlock
     ]
   });
 }
@@ -1238,92 +1750,33 @@ function getPerspectiveInstruction(perspective?: ReviewerPerspective): string {
   switch (perspective) {
     case "technical":
       return [
-        "Your assigned lens is TECHNICAL FIT.",
-        "Focus on: whether the draft uses job-specific keywords correctly,",
-        "whether technical claims have concrete evidence (numbers, architecture decisions, tools),",
-        "and whether the experience genuinely maps to the target role's responsibilities.",
-        "Do NOT comment on tone or emotional authenticity — another reviewer handles that."
+        "Your assigned lens is EVIDENCE & FACTUAL SAFETY.",
+        "Focus on: whether claims have concrete evidence (numbers, ownership, tools, implementation detail),",
+        "whether project-level outcomes are being overstated as personal contribution,",
+        "and whether the draft safely distinguishes implementation, operations, and decision-making responsibility.",
+        "Do NOT focus on tone or emotional authenticity — another reviewer handles that."
       ].join(" ");
     case "interviewer":
       return [
-        "Your assigned lens is INTERVIEWER SIMULATION.",
+        "Your assigned lens is COMPANY & ROLE FIT.",
         "Read the draft as a hiring manager would.",
-        "Focus on: what follow-up questions this draft would trigger,",
-        "where the logic has gaps that an interviewer would probe,",
-        "and whether the 'why this company / why this role' argument is convincing or generic.",
-        "Do NOT focus on technical keyword density — another reviewer handles that."
+        "Focus on: whether the 'why this company / why this role' argument is convincing or generic,",
+        "whether the candidate's experience really connects to the target position,",
+        "and what follow-up questions this fit story would trigger in an interview.",
+        "Do NOT focus on tone or raw evidence density — other reviewers handle that."
       ].join(" ");
     case "authenticity":
       return [
-        "Your assigned lens is AUTHENTICITY & VOICE.",
+        "Your assigned lens is VOICE & AUTHENTICITY.",
         "Focus on: whether the draft sounds like a real person or an AI template,",
         "whether emotions and growth narrative feel genuine,",
         "whether any sentence could be copy-pasted into a different company's application unchanged,",
         "and whether the writer's personality comes through.",
-        "Do NOT focus on technical accuracy — another reviewer handles that."
+        "Do NOT focus on technical accuracy or company-role fit — other reviewers handle those."
       ].join(" ");
     default:
       return "";
   }
-}
-
-function buildCoordinatorPrompt(
-  contextMarkdown: string,
-  notionBrief: string,
-  userInterventions: Array<{ round: number; text: string }>,
-  turns: ReviewTurn[],
-  latestArtifacts?: RunArtifacts
-): BuiltPrompt {
-  const discussion = turns
-    .map((turn) => `## ${turnLabel(turn)} round ${turn.round}\n${turn.response}`)
-    .join("\n\n");
-  const discussionBlock = `## Reviewer Discussion For This Cycle\n${discussion}`;
-  const interventionBlock = buildUserGuidanceBlock(userInterventions);
-  const sessionSnapshot = buildSessionSnapshotBlock(latestArtifacts);
-  const hasUserGuidance = userInterventions.length > 0;
-
-  const sectionRequirements = hasUserGuidance
-    ? [
-        "## User Guidance Response",
-        "  - For each user guidance item, state whether you ACCEPT or ADAPT it",
-        "  - If ADAPT: explain what condition would make the user's direction work",
-        "  - Never dismiss user guidance without proposing an alternative that preserves their intent",
-        "## Summary",
-        "## Improvement Plan",
-        "## Revised Draft"
-      ]
-    : [
-        "## Summary",
-        "## Improvement Plan",
-        "## Revised Draft"
-      ];
-
-  return buildPrompt({
-    promptKind: "deep-coordinator",
-    contextProfile: "full",
-    contextMarkdown,
-    notionBrief,
-    historyBlocks: [sessionSnapshot, discussionBlock],
-    sections: [
-    "You are the coordinator for an ongoing multi-model essay feedback session.",
-    buildStructuredKoreanResponseInstruction(),
-    "Update the current session outputs using the latest reviewer discussion.",
-    "Return Markdown with exactly these top-level sections:",
-    ...sectionRequirements,
-    "",
-    contextMarkdown,
-    "",
-    notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
-    notionBrief ? "" : "",
-    sessionSnapshot,
-    sessionSnapshot ? "" : "",
-    interventionBlock,
-    interventionBlock ? "" : "",
-    discussionBlock,
-    "",
-    "Keep the revised draft aligned with the latest voice and structure while fixing the highest-priority issues."
-    ]
-  });
 }
 
 function buildRealtimeCoordinatorDiscussionPrompt(
@@ -1357,14 +1810,26 @@ function buildRealtimeCoordinatorDiscussionPrompt(
     "## Current Focus",
     "## Target Section",
     "## Target Section Key",
+    "## Current Objective",
+    "## Rewrite Direction",
+    "## Must Keep",
+    "## Must Resolve",
+    "## Available Evidence",
+    "## Exit Criteria",
+    "## Next Owner",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
     "## Deferred Challenges",
     "## Section Outcome",
     "## Challenge Decisions",
-    "Write Current Focus as one line, Target Section as a short label, and Mini Draft as a 2-4 sentence candidate rewrite for only that target section.",
+    "Write Current Focus as one line and Target Section as a short label.",
     "Write Target Section Key as a stable slug for the current target section.",
+    "Use Current Objective to define the section-level success target.",
+    "Use Rewrite Direction to describe how the next section draft should change without writing the whole essay.",
+    "Must Keep, Must Resolve, Available Evidence, and Exit Criteria must use bullet items. If empty, write exactly '- 없음'.",
+    "Next Owner should usually be section_drafter unless more research is clearly required.",
+    "Mini Draft should be only a short seed or outline, not polished final prose. The drafter will write the actual section text next.",
     "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
     "Open Challenges are blockers for the current Target Section only.",
     "Deferred Challenges are valid follow-up issues for later sections or final polish.",
@@ -1427,14 +1892,24 @@ function buildRealtimeCoordinatorRedirectPrompt(
     "## Current Focus",
     "## Target Section",
     "## Target Section Key",
+    "## Current Objective",
+    "## Rewrite Direction",
+    "## Must Keep",
+    "## Must Resolve",
+    "## Available Evidence",
+    "## Exit Criteria",
+    "## Next Owner",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
     "## Deferred Challenges",
     "## Section Outcome",
     "## Challenge Decisions",
-    "Acknowledge the new user message by reflecting it inside Current Focus and Mini Draft.",
+    "Acknowledge the new user message by reflecting it inside Current Focus and Rewrite Direction.",
     "Write Target Section Key as a stable slug for the current target section.",
+    "Must Keep, Must Resolve, Available Evidence, and Exit Criteria must use bullet items. If empty, write exactly '- 없음'.",
+    "Next Owner should usually be section_drafter unless more research is clearly required.",
+    "Mini Draft should be only a short seed or outline, not polished final prose.",
     "Accepted Decisions, Open Challenges, and Deferred Challenges must use bullet items. If empty, write exactly '- 없음'.",
     "Open Challenges are blockers for the current Target Section only.",
     "Deferred Challenges are valid follow-up issues for later sections or final polish.",
@@ -1481,7 +1956,7 @@ function buildRealtimeReviewerPrompt(
     return true;
   });
   const historyBlock = buildRealtimeDiscussionHistory(
-    visibleTurns.filter((turn) => turn.role === "coordinator" && turn.round < round),
+    visibleTurns.filter((turn) => turn.participantId === "coordinator" && turn.round < round),
     { maxTurns: 2, maxCharsPerTurn: 220 }
   );
   const coordinatorReferenceBlock = buildCoordinatorReferenceBlock(visibleTurns, round, ledger);
@@ -1503,10 +1978,10 @@ function buildRealtimeReviewerPrompt(
     buildRealtimeKoreanResponseInstruction(),
     perspectiveInstruction,
     `Round: ${round}`,
-    "Review the coordinator's current discussion ledger, especially the Mini Draft.",
+    "Review the current discussion ledger, especially the Section Draft when available and otherwise the Mini Draft seed.",
     "Keep the blind review rule: do not assume anything about same-round reviewer replies that are not shown below.",
     "Respond in exactly 3 short labeled lines plus one final status line.",
-    'Line 1 starts with "Mini Draft:" and identify one phrase or sentence in the Mini Draft to keep or revise.',
+    'Line 1 starts with "Mini Draft:" and identify one phrase or sentence in the current section draft to keep or revise.',
     'Line 2 starts with "Challenge:" and use exactly one verdict in the form "Challenge: [ticketId|new] close because ...", "Challenge: [ticketId|new] keep-open because ...", or "Challenge: [ticketId|new] defer because ...".',
     crossFeedbackInstruction,
     "The final line must be exactly one of these:",
@@ -1556,11 +2031,11 @@ function buildRealtimeFinalDraftPrompt(
     historyBlocks: [historyBlock],
     discussionLedgerBlock: ledgerBlock,
     sections: [
-    "You are the coordinator closing a realtime multi-model essay review session.",
+    "You are the finalizer closing a realtime multi-model essay review session.",
     buildFinalEssayKoreanInstruction(),
     "The current section is ready, no blocking reviewer feedback remains, and there are no Deferred Challenges left.",
     "Write the final polished essay draft now.",
-    "Use the Mini Draft as the local seed, preserve the Accepted Decisions, and keep the final essay aligned with the resolved focus.",
+    "Use the Section Draft when available as the local seed, preserve the Accepted Decisions, and keep the final essay aligned with the resolved focus.",
     "Return only the rewritten essay in Markdown.",
     "Do not include section headings, status tags, summaries, or extra commentary.",
     "",
@@ -1607,6 +2082,13 @@ function buildDevilsAdvocatePrompt(
     "## Current Focus",
     "## Target Section",
     "## Target Section Key",
+    "## Current Objective",
+    "## Rewrite Direction",
+    "## Must Keep",
+    "## Must Resolve",
+    "## Available Evidence",
+    "## Exit Criteria",
+    "## Next Owner",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
@@ -1615,6 +2097,9 @@ function buildDevilsAdvocatePrompt(
     "## Challenge Decisions",
     "Use this turn to challenge one assumption the reviewers accepted too quickly and add at least one concrete Open Challenge.",
     "Write Target Section Key as a stable slug for the current target section.",
+    "Must Keep, Must Resolve, Available Evidence, and Exit Criteria must use bullet items. If empty, write exactly '- 없음'.",
+    "Next Owner should usually be section_drafter unless more research is clearly required.",
+    "Mini Draft should be only a short seed or outline, not polished final prose.",
     "Deferred Challenges should capture later follow-up issues instead of blocking the current section.",
     "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
     "Use Challenge Decisions to mark ticket transitions with lines like '- [ticketId] close' or '- [new] add | sectionKey=... | sectionLabel=... | severity=advisory | text=...'.",
@@ -1669,6 +2154,13 @@ function buildWeakConsensusPolishPrompt(
     "## Current Focus",
     "## Target Section",
     "## Target Section Key",
+    "## Current Objective",
+    "## Rewrite Direction",
+    "## Must Keep",
+    "## Must Resolve",
+    "## Available Evidence",
+    "## Exit Criteria",
+    "## Next Owner",
     "## Mini Draft",
     "## Accepted Decisions",
     "## Open Challenges",
@@ -1676,6 +2168,9 @@ function buildWeakConsensusPolishPrompt(
     "## Section Outcome",
     "## Challenge Decisions",
     "Write Target Section Key as a stable slug for the current target section.",
+    "Must Keep, Must Resolve, Available Evidence, and Exit Criteria must use bullet items. If empty, write exactly '- 없음'.",
+    "Next Owner should usually be section_drafter unless more research is clearly required.",
+    "Mini Draft should be only a short seed or outline, not polished final prose.",
     "Write Section Outcome as exactly one of: keep-open, close-section, handoff-next-section, write-final.",
     "Do not invent new blocker scope unless the reviewer feedback clearly justifies it.",
     "Use Challenge Decisions to close, keep-open, defer, promote, or add tickets as needed.",
@@ -1707,7 +2202,7 @@ function buildNotionPrePassPrompt(
     contextProfile: "minimal",
     contextMarkdown,
     sections: [
-    "You are the coordinator for a multi-model essay feedback discussion.",
+    "You are the context researcher for a multi-model essay feedback discussion.",
     buildNotionPrePassKoreanInstruction(),
     "Before the main review starts, use your configured Notion MCP tools to resolve the user's Notion request.",
     "Search for the most relevant Notion page or database entries, then summarize only the context that will improve the essay review.",
@@ -1727,6 +2222,48 @@ function buildNotionPrePassPrompt(
     "",
     requestHeading,
     notionRequest?.text ?? ""
+    ]
+  });
+}
+
+function buildRealtimeSectionDrafterPrompt(
+  contextMarkdown: string,
+  notionBrief: string,
+  userInterventions: Array<{ round: number; text: string }>,
+  turns: ReviewTurn[],
+  round: number,
+  ledger: DiscussionLedger
+): BuiltPrompt {
+  const guidanceBlock = buildUserGuidanceBlock(userInterventions, "round");
+  const historyBlock = buildRealtimeDiscussionHistory(turns, { maxTurns: 3, maxCharsPerTurn: 260 });
+  const ledgerBlock = buildDiscussionLedgerBlock(ledger);
+
+  return buildPrompt({
+    promptKind: "realtime-drafter",
+    contextProfile: "compact",
+    contextMarkdown,
+    notionBrief,
+    historyBlocks: [historyBlock],
+    discussionLedgerBlock: ledgerBlock,
+    sections: [
+      "You are the section drafter in a realtime multi-model essay workflow.",
+      buildStructuredKoreanResponseInstruction(),
+      `Round: ${round}`,
+      "Use the coordinator's ledger to write the actual section prose for the current target section.",
+      "Do not invent new evidence or claims outside the provided context, Notion Brief, and ledger.",
+      "Return Markdown with exactly these top-level sections:",
+      "## Section Draft",
+      "## Change Rationale",
+      "",
+      contextMarkdown,
+      "",
+      notionBrief ? "## Notion Brief\n\n" + notionBrief : "",
+      notionBrief ? "" : "",
+      ledgerBlock,
+      "",
+      guidanceBlock,
+      guidanceBlock ? "" : "",
+      historyBlock
     ]
   });
 }
@@ -1768,13 +2305,23 @@ function buildDiscussionLedgerBlock(ledger?: DiscussionLedger, heading = "## Dis
     heading,
     `- Updated At Round: ${ledger.updatedAtRound}`,
     `- Target Section: ${ledger.targetSection}`,
+    ...(ledger.targetSectionKey ? [`- Target Section Key: ${ledger.targetSectionKey}`] : []),
+    ...(ledger.nextOwner ? [`- Next Owner: ${ledger.nextOwner}`] : []),
     "",
     "### Current Focus",
     ledger.currentFocus,
     "",
+    ...(ledger.currentObjective ? ["### Current Objective", ledger.currentObjective, ""] : []),
+    ...(ledger.rewriteDirection ? ["### Rewrite Direction", ledger.rewriteDirection, ""] : []),
     "### Mini Draft",
     ledger.miniDraft,
     "",
+    ...(ledger.sectionDraft ? ["### Section Draft", ledger.sectionDraft, ""] : []),
+    ...(ledger.changeRationale ? ["### Change Rationale", ledger.changeRationale, ""] : []),
+    ...(ledger.mustKeep ? ["### Must Keep", ...formatDiscussionLedgerItems(ledger.mustKeep), ""] : []),
+    ...(ledger.mustResolve ? ["### Must Resolve", ...formatDiscussionLedgerItems(ledger.mustResolve), ""] : []),
+    ...(ledger.availableEvidence ? ["### Available Evidence", ...formatDiscussionLedgerItems(ledger.availableEvidence), ""] : []),
+    ...(ledger.exitCriteria ? ["### Exit Criteria", ...formatDiscussionLedgerItems(ledger.exitCriteria), ""] : []),
     "### Accepted Decisions",
     ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
     "",
@@ -1809,13 +2356,22 @@ function buildDiscussionLedgerArtifact(ledger: DiscussionLedger): string {
     `- Target Section: ${ledger.targetSection}`,
     ...(ledger.targetSectionKey ? [`- Target Section Key: ${ledger.targetSectionKey}`] : []),
     ...(ledger.sectionOutcome ? [`- Section Outcome: ${ledger.sectionOutcome}`] : []),
+    ...(ledger.nextOwner ? [`- Next Owner: ${ledger.nextOwner}`] : []),
     "",
     "## Current Focus",
     ledger.currentFocus,
     "",
+    ...(ledger.currentObjective ? ["## Current Objective", ledger.currentObjective, ""] : []),
+    ...(ledger.rewriteDirection ? ["## Rewrite Direction", ledger.rewriteDirection, ""] : []),
     "## Mini Draft",
     ledger.miniDraft,
     "",
+    ...(ledger.sectionDraft ? ["## Section Draft", ledger.sectionDraft, ""] : []),
+    ...(ledger.changeRationale ? ["## Change Rationale", ledger.changeRationale, ""] : []),
+    ...(ledger.mustKeep ? ["## Must Keep", ...formatDiscussionLedgerItems(ledger.mustKeep), ""] : []),
+    ...(ledger.mustResolve ? ["## Must Resolve", ...formatDiscussionLedgerItems(ledger.mustResolve), ""] : []),
+    ...(ledger.availableEvidence ? ["## Available Evidence", ...formatDiscussionLedgerItems(ledger.availableEvidence), ""] : []),
+    ...(ledger.exitCriteria ? ["## Exit Criteria", ...formatDiscussionLedgerItems(ledger.exitCriteria), ""] : []),
     "## Accepted Decisions",
     ...formatDiscussionLedgerItems(ledger.acceptedDecisions),
     "",
@@ -1843,7 +2399,9 @@ function formatDiscussionLedgerItems(items: string[]): string[] {
 function extractDiscussionLedger(output: string, round: number): DiscussionLedger | undefined {
   const currentFocus = normalizeLedgerSingleLine(extractMarkdownSection(output, "Current Focus"));
   const targetSection = normalizeLedgerSingleLine(extractMarkdownSection(output, "Target Section"));
-  const miniDraft = normalizeLedgerParagraph(extractMarkdownSection(output, "Mini Draft"));
+  const rewriteDirection = normalizeLedgerParagraph(extractMarkdownSection(output, "Rewrite Direction"));
+  const currentObjective = normalizeLedgerParagraph(extractMarkdownSection(output, "Current Objective"));
+  const miniDraft = normalizeLedgerParagraph(extractMarkdownSection(output, "Mini Draft")) || rewriteDirection;
   if (!currentFocus || !targetSection || !miniDraft) {
     return undefined;
   }
@@ -1876,6 +2434,17 @@ function extractDiscussionLedger(output: string, round: number): DiscussionLedge
   return {
     currentFocus,
     miniDraft,
+    rewriteDirection: rewriteDirection || undefined,
+    currentObjective: currentObjective || undefined,
+    mustKeep: parseDiscussionLedgerItems(extractMarkdownSection(output, "Must Keep")),
+    mustResolve: parseDiscussionLedgerItems(extractMarkdownSection(output, "Must Resolve")),
+    availableEvidence: parseDiscussionLedgerItems(extractMarkdownSection(output, "Available Evidence")),
+    exitCriteria: parseDiscussionLedgerItems(extractMarkdownSection(output, "Exit Criteria")),
+    nextOwner: normalizeLedgerSingleLine(extractMarkdownSection(output, "Next Owner"))
+      ? normalizeEssayRoleId(extractMarkdownSection(output, "Next Owner"), "section_drafter")
+      : undefined,
+    sectionDraft: normalizeLedgerParagraph(extractMarkdownSection(output, "Section Draft")) || undefined,
+    changeRationale: normalizeLedgerParagraph(extractMarkdownSection(output, "Change Rationale")) || undefined,
     acceptedDecisions: parseDiscussionLedgerItems(extractMarkdownSection(output, "Accepted Decisions")),
     openChallenges: derivedViews?.openChallenges ?? openChallenges,
     deferredChallenges: derivedViews?.deferredChallenges ?? deferredChallenges,
@@ -2244,9 +2813,18 @@ function transitionDiscussionLedgerToNextCluster(
   return {
     ...ledger,
     currentFocus: `${cluster.sectionLabel} 섹션으로 handoff해 남은 쟁점을 정리합니다.`,
+    currentObjective: `${cluster.sectionLabel} 섹션의 남은 쟁점을 해결합니다.`,
     targetSection: cluster.sectionLabel,
     targetSectionKey: cluster.sectionKey,
+    rewriteDirection: `${cluster.sectionLabel} 섹션의 핵심 논점을 다시 정렬합니다.`,
     miniDraft: `${cluster.sectionLabel} 미니 초안을 다음 라운드에서 새로 정리합니다.`,
+    sectionDraft: undefined,
+    changeRationale: undefined,
+    mustKeep: [],
+    mustResolve: cluster.tickets.map((ticket) => ticket.text),
+    availableEvidence: [],
+    exitCriteria: [],
+    nextOwner: "section_drafter",
     openChallenges: derivedViews.openChallenges,
     deferredChallenges: derivedViews.deferredChallenges,
     tickets,
@@ -2349,7 +2927,8 @@ function buildSessionSnapshotBlock(artifacts?: RunArtifacts): string {
     "## Current Session Snapshot",
     `### Current Summary\n${artifacts.summary}`,
     `### Current Improvement Plan\n${artifacts.improvementPlan}`,
-    `### Current Revised Draft\n${artifacts.revisedDraft}`
+    `### Current Revised Draft\n${artifacts.revisedDraft}`,
+    artifacts.finalChecks ? `### Current Final Checks\n${artifacts.finalChecks}` : ""
   ].join("\n\n");
 }
 
@@ -2504,7 +3083,7 @@ function buildCoordinatorReferenceBlock(
 ): string {
   const previousCoordinatorTurn = [...turns]
     .reverse()
-    .find((turn) => turn.status === "completed" && turn.role === "coordinator" && turn.round > 0 && turn.round < round);
+    .find((turn) => turn.status === "completed" && turn.participantId === "coordinator" && turn.round > 0 && turn.round < round);
   const previousLedger = previousCoordinatorTurn
     ? extractDiscussionLedger(previousCoordinatorTurn.response, previousCoordinatorTurn.round)
     : undefined;
@@ -2772,37 +3351,82 @@ function turnLabel(turn: ReviewTurn): string {
   return turn.participantLabel || providerLabel(turn.providerId);
 }
 
-function buildCoordinatorParticipant(providerId: ProviderId): ReviewParticipant {
+function buildResearchParticipant(assignment: RoleAssignment): ReviewParticipant {
   return {
-    participantId: "coordinator",
-    participantLabel: `${providerLabel(providerId)} coordinator`,
-    providerId,
-    role: "coordinator"
+    participantId: "context-researcher",
+    participantLabel: `${providerLabel(assignment.providerId)} context researcher`,
+    providerId: assignment.providerId,
+    role: "researcher",
+    assignment,
+    roleId: "context_researcher"
   };
 }
 
-const REVIEWER_PERSPECTIVES: ReviewerPerspective[] = ["technical", "interviewer", "authenticity"];
+function buildCoordinatorParticipant(assignment: RoleAssignment): ReviewParticipant {
+  return {
+    participantId: "coordinator",
+    participantLabel: `${providerLabel(assignment.providerId)} section coordinator`,
+    providerId: assignment.providerId,
+    role: "coordinator",
+    assignment,
+    roleId: "section_coordinator"
+  };
+}
 
-function buildReviewerParticipants(providerIds: ProviderId[]): ReviewParticipant[] {
-  const totals = new Map<ProviderId, number>();
-  for (const providerId of providerIds) {
-    totals.set(providerId, (totals.get(providerId) ?? 0) + 1);
-  }
+function buildDrafterParticipant(assignment: RoleAssignment): ReviewParticipant {
+  return {
+    participantId: "section-drafter",
+    participantLabel: `${providerLabel(assignment.providerId)} section drafter`,
+    providerId: assignment.providerId,
+    role: "drafter",
+    assignment,
+    roleId: "section_drafter"
+  };
+}
 
-  const seen = new Map<ProviderId, number>();
-  return providerIds.map((providerId, index) => {
-    const next = (seen.get(providerId) ?? 0) + 1;
-    seen.set(providerId, next);
-    const duplicateCount = totals.get(providerId) ?? 1;
-    const perspective = REVIEWER_PERSPECTIVES[index % REVIEWER_PERSPECTIVES.length];
-    return {
-      participantId: `reviewer-${index + 1}`,
-      participantLabel: duplicateCount > 1 ? `${providerLabel(providerId)} reviewer ${next}` : `${providerLabel(providerId)} reviewer`,
-      providerId,
+function buildFinalizerParticipant(assignment: RoleAssignment): ReviewParticipant {
+  return {
+    participantId: "finalizer",
+    participantLabel: `${providerLabel(assignment.providerId)} finalizer`,
+    providerId: assignment.providerId,
+    role: "finalizer",
+    assignment,
+    roleId: "finalizer"
+  };
+}
+
+function buildReviewerParticipants(
+  roles: Record<"fit_reviewer" | "evidence_reviewer" | "voice_reviewer", RoleAssignment>
+): ReviewParticipant[] {
+  return [
+    {
+      participantId: "reviewer-1",
+      participantLabel: `${providerLabel(roles.evidence_reviewer.providerId)} evidence reviewer`,
+      providerId: roles.evidence_reviewer.providerId,
       role: "reviewer",
-      perspective
-    };
-  });
+      assignment: roles.evidence_reviewer,
+      roleId: "evidence_reviewer",
+      perspective: "technical"
+    },
+    {
+      participantId: "reviewer-2",
+      participantLabel: `${providerLabel(roles.fit_reviewer.providerId)} fit reviewer`,
+      providerId: roles.fit_reviewer.providerId,
+      role: "reviewer",
+      assignment: roles.fit_reviewer,
+      roleId: "fit_reviewer",
+      perspective: "interviewer"
+    },
+    {
+      participantId: "reviewer-3",
+      participantLabel: `${providerLabel(roles.voice_reviewer.providerId)} voice reviewer`,
+      providerId: roles.voice_reviewer.providerId,
+      role: "reviewer",
+      assignment: roles.voice_reviewer,
+      roleId: "voice_reviewer",
+      perspective: "authenticity"
+    }
+  ];
 }
 
 function truncateContinuationText(text: string, maxLength: number): string {

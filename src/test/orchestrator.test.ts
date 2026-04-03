@@ -3,7 +3,7 @@ import test from "node:test";
 import { ContextCompiler } from "../core/contextCompiler";
 import { OrchestratorGateway, ReviewOrchestrator } from "../core/orchestrator";
 import { getProviderCapabilities } from "../core/providerOptions";
-import { ProviderRuntimeState, RunEvent } from "../core/types";
+import { ProviderRuntimeState, RunActorRole, RunEvent } from "../core/types";
 import { cleanupTempWorkspace, createStorage, createTempWorkspace } from "./helpers";
 
 class FakeGateway implements OrchestratorGateway {
@@ -14,6 +14,8 @@ class FakeGateway implements OrchestratorGateway {
     messageScope?: string;
     participantId?: string;
     participantLabel?: string;
+    modelOverride?: string;
+    effortOverride?: string;
   }> = [];
 
   constructor(
@@ -24,10 +26,12 @@ class FakeGateway implements OrchestratorGateway {
       round?: number,
       options?: {
         round?: number;
-        speakerRole?: "reviewer" | "coordinator";
+        speakerRole?: RunActorRole;
         messageScope?: string;
         participantId?: string;
         participantLabel?: string;
+        modelOverride?: string;
+        effortOverride?: string;
         onEvent?: (event: RunEvent) => Promise<void> | void;
       }
     ) => string | Error,
@@ -36,10 +40,12 @@ class FakeGateway implements OrchestratorGateway {
       prompt: string,
       options: {
         round?: number;
-        speakerRole?: "reviewer" | "coordinator";
+        speakerRole?: RunActorRole;
         messageScope?: string;
         participantId?: string;
         participantLabel?: string;
+        modelOverride?: string;
+        effortOverride?: string;
         onEvent?: (event: RunEvent) => Promise<void> | void;
       }
     ) => Promise<void> | void
@@ -58,10 +64,12 @@ class FakeGateway implements OrchestratorGateway {
     prompt: string,
     options: {
       round?: number;
-      speakerRole?: "reviewer" | "coordinator";
+      speakerRole?: RunActorRole;
       messageScope?: string;
       participantId?: string;
       participantLabel?: string;
+      modelOverride?: string;
+      effortOverride?: string;
       onEvent?: (event: RunEvent) => Promise<void> | void;
     }
   ): Promise<{ text: string; stdout: string; stderr: string; exitCode: number }> {
@@ -71,7 +79,9 @@ class FakeGateway implements OrchestratorGateway {
       round: options.round,
       messageScope: options.messageScope,
       participantId: options.participantId,
-      participantLabel: options.participantLabel
+      participantLabel: options.participantLabel,
+      modelOverride: options.modelOverride,
+      effortOverride: options.effortOverride
     });
     if (this.streamer) {
       await this.streamer(providerId, prompt, options);
@@ -150,7 +160,17 @@ test("orchestrator completes a run, writes artifacts, and remembers the coordina
   await storage.saveProjectTextDocument(project.slug, "Posting", "Risk platform ownership", true);
 
   const compiler = new ContextCompiler(storage);
-  const gateway = new FakeGateway(healthyStates(), (providerId) => {
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt) => {
+    if (providerId === "claude" && /You are the finalizer for a multi-model essay revision workflow/i.test(prompt)) {
+      return [
+        "## Final Draft",
+        "Rewritten essay",
+        "## Final Checks",
+        "- Final evidence check remains pending.",
+        "- Cross-verify the quantified outcomes."
+      ].join("\n");
+    }
+
     if (providerId === "claude") {
       return ["## Summary", "Strong draft with room for sharper evidence.", "## Improvement Plan", "- Add quantified outcomes.", "## Revised Draft", "Rewritten essay"].join("\n");
     }
@@ -178,15 +198,19 @@ test("orchestrator completes a run, writes artifacts, and remembers the coordina
 
   assert.equal(result.run.status, "completed");
   assert.equal(result.artifacts.revisedDraft, "Rewritten essay");
+  assert.match(result.artifacts.finalChecks ?? "", /Final evidence check remains pending/);
   const summary = await storage.readOptionalRunArtifact(project.slug, result.run.id, "summary.md");
   const improvementPlan = await storage.readOptionalRunArtifact(project.slug, result.run.id, "improvement-plan.md");
   const revisedDraft = await storage.readOptionalRunArtifact(project.slug, result.run.id, "revised-draft.md");
+  const finalChecks = await storage.readOptionalRunArtifact(project.slug, result.run.id, "final-checks.md");
   assert.ok(summary);
   assert.ok(improvementPlan);
   assert.ok(revisedDraft);
+  assert.ok(finalChecks);
   assert.match(summary, /Strong draft/);
   assert.match(improvementPlan, /quantified outcomes/);
   assert.match(revisedDraft, /Rewritten essay/);
+  assert.match(finalChecks, /Final evidence check remains pending/);
   assert.equal((await storage.getPreferences()).lastCoordinatorProvider, "claude");
   assert.equal((await storage.getPreferences()).lastReviewMode, "deepFeedback");
   assert.ok(events.some((event) => event.type === "run-completed"));
@@ -311,11 +335,111 @@ test("orchestrator runs a coordinator notion pre-pass and shares the notion brie
   assert.match(notionCall.prompt, /use your configured Notion MCP tools/i);
 
   const reviewerCalls = gateway.calls.filter(
-    (call) => call.round === 1 && call.providerId !== "claude"
+    (call) => call.round === 1 && call.participantId?.startsWith("reviewer-")
   );
-  assert.equal(reviewerCalls.length, 2);
+  assert.equal(reviewerCalls.length, 3);
   assert.ok(reviewerCalls.every((call) => /## Notion Brief/.test(call.prompt)));
   assert.ok(reviewerCalls.every((call) => /Do not search Notion/.test(call.prompt)));
+});
+
+test("orchestrator routes role assignments and override settings to researcher and reviewers", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("CJ OliveNetworks");
+  await storage.saveProfileTextDocument("Career", "Built commerce and platform products", true);
+
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt) => {
+    if (/use your configured Notion MCP tools/i.test(prompt)) {
+      return [
+        "## Resolution",
+        "Found the most relevant hiring notes.",
+        "## Notion Brief",
+        "CJ OliveNetworks expects platform delivery ownership and measurable collaboration.",
+        "## Sources Considered",
+        "- CJ OliveNetworks hiring notes"
+      ].join("\n");
+    }
+
+    if (providerId === "claude") {
+      return [
+        "## Summary",
+        "Use the platform-delivery brief more explicitly.",
+        "## Improvement Plan",
+        "- Connect measurable collaboration to the target role.",
+        "## Revised Draft",
+        "Updated final essay"
+      ].join("\n");
+    }
+
+    return [
+      "## Overall Verdict",
+      "Useful",
+      "## Strengths",
+      "- Concrete role mapping",
+      "## Problems",
+      "- Needs stronger evidence",
+      "## Suggestions",
+      "- Add implementation detail",
+      "## Direct Responses To Other Reviewers",
+      "- Agree"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  const roleAssignments = [
+    { role: "context_researcher", providerId: "codex", useProviderDefaults: false, modelOverride: "gpt-5.4-mini", effortOverride: "high" },
+    { role: "section_coordinator", providerId: "claude", useProviderDefaults: true },
+    { role: "section_drafter", providerId: "claude", useProviderDefaults: true },
+    { role: "fit_reviewer", providerId: "gemini", useProviderDefaults: false, modelOverride: "gemini-2.5-pro" },
+    { role: "evidence_reviewer", providerId: "codex", useProviderDefaults: false, modelOverride: "gpt-5.4", effortOverride: "medium" },
+    { role: "voice_reviewer", providerId: "claude", useProviderDefaults: false, modelOverride: "sonnet", effortOverride: "max" },
+    { role: "finalizer", providerId: "claude", useProviderDefaults: true }
+  ] as const;
+
+  const result = await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why CJ OliveNetworks?",
+    draft: "I want to join because I like building services.",
+    reviewMode: "deepFeedback",
+    notionRequest: "CJ 올리브네트웍스 관련 노션 맥락을 가져와줘",
+    roleAssignments: [...roleAssignments],
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "gemini", "claude"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  assert.equal(result.run.roleAssignments?.length, 7);
+  const researcherCall = gateway.calls.find((call) => call.participantId === "context-researcher");
+  assert.ok(researcherCall);
+  assert.equal(researcherCall.providerId, "codex");
+  assert.equal(researcherCall.modelOverride, "gpt-5.4-mini");
+  assert.equal(researcherCall.effortOverride, "high");
+  assert.match(researcherCall.prompt, /Notion MCP tools/i);
+
+  const evidenceCall = gateway.calls.find((call) => call.participantId === "reviewer-1");
+  assert.ok(evidenceCall);
+  assert.equal(evidenceCall.providerId, "codex");
+  assert.equal(evidenceCall.modelOverride, "gpt-5.4");
+  assert.equal(evidenceCall.effortOverride, "medium");
+  assert.match(evidenceCall.participantLabel ?? "", /evidence reviewer/i);
+
+  const fitCall = gateway.calls.find((call) => call.participantId === "reviewer-2");
+  assert.ok(fitCall);
+  assert.equal(fitCall.providerId, "gemini");
+  assert.equal(fitCall.modelOverride, "gemini-2.5-pro");
+  assert.equal(fitCall.effortOverride, undefined);
+  assert.match(fitCall.participantLabel ?? "", /fit reviewer/i);
+
+  const voiceCall = gateway.calls.find((call) => call.participantId === "reviewer-3");
+  assert.ok(voiceCall);
+  assert.equal(voiceCall.providerId, "claude");
+  assert.equal(voiceCall.modelOverride, "sonnet");
+  assert.equal(voiceCall.effortOverride, "max");
+  assert.match(voiceCall.participantLabel ?? "", /voice reviewer/i);
 });
 
 test("orchestrator skips notion pre-pass for punctuation-only notion requests without fixed pages", async (t) => {
@@ -828,6 +952,134 @@ test("realtime mode waits for a document-ready state and saves only the final dr
   assert.match(reviewerPrompt.prompt, /Status: APPROVE/);
 });
 
+test("realtime mode uses the finalizer role assignment and override settings for the closing draft", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Kurly");
+  await storage.saveProfileTextDocument("Career", "Built product and growth systems", true);
+
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (providerId, prompt) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종 지원서 초안";
+    }
+
+    if (providerId === "claude") {
+      return buildRealtimeLedgerResponse({
+        currentFocus: "핵심 성과와 회사 연결을 한 문단으로 정리합니다.",
+        targetSection: "도입 문단",
+        miniDraft: "결제 안정화 경험을 먼저 제시하고 그 경험이 컬리의 사용자 신뢰와 이어진다고 정리합니다.",
+        acceptedDecisions: ["성과 수치를 초반에 배치한다"],
+        openChallenges: []
+      });
+    }
+
+    return [
+      "Mini Draft: 방향은 좋습니다.",
+      "Challenge: 남은 쟁점은 없습니다.",
+      "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  const roleAssignments = [
+    { role: "context_researcher", providerId: "claude", useProviderDefaults: true },
+    { role: "section_coordinator", providerId: "claude", useProviderDefaults: true },
+    { role: "section_drafter", providerId: "claude", useProviderDefaults: true },
+    { role: "fit_reviewer", providerId: "gemini", useProviderDefaults: true },
+    { role: "evidence_reviewer", providerId: "codex", useProviderDefaults: true },
+    { role: "voice_reviewer", providerId: "claude", useProviderDefaults: true },
+    { role: "finalizer", providerId: "codex", useProviderDefaults: false, modelOverride: "gpt-5.4", effortOverride: "xhigh" }
+  ] as const;
+
+  const result = await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Kurly?",
+    draft: "사용자 문제를 해결하는 서비스가 좋아요.",
+    reviewMode: "realtime",
+    roleAssignments: [...roleAssignments],
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex", "gemini", "claude"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  assert.equal(result.run.status, "completed");
+  assert.equal(result.artifacts.revisedDraft, "최종 지원서 초안");
+  const finalizerCall = gateway.calls.find((call) => call.participantId === "finalizer");
+  assert.ok(finalizerCall);
+  assert.equal(finalizerCall.providerId, "codex");
+  assert.equal(finalizerCall.modelOverride, "gpt-5.4");
+  assert.equal(finalizerCall.effortOverride, "xhigh");
+  assert.match(finalizerCall.messageScope ?? "", /realtime-round-1-finalizer-final/);
+});
+
+test("realtime inserts the section drafter between the coordinator and reviewers", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Kurly");
+  await storage.saveProfileTextDocument("Career", "Built product and growth systems", true);
+
+  const compiler = new ContextCompiler(storage);
+  const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, _round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종 지원서 초안";
+    }
+
+    if (options?.speakerRole === "drafter") {
+      return [
+        "## Section Draft",
+        "드래프터가 다시 쓴 협업 문단입니다.",
+        "",
+        "## Change Rationale",
+        "성과와 협업 연결을 한 문단으로 바로 읽히게 정리했습니다."
+      ].join("\n");
+    }
+
+    if (options?.speakerRole === "coordinator") {
+      return buildRealtimeLedgerResponse({
+        currentFocus: "협업 성과를 더 또렷하게 정리합니다.",
+        targetSection: "협업 문단",
+        miniDraft: "초기 미니 초안입니다.",
+        acceptedDecisions: ["협업 장면을 구체화한다"],
+        openChallenges: []
+      });
+    }
+
+    return [
+      "Mini Draft: 방향은 충분합니다.",
+      "Challenge: 남은 쟁점은 없습니다.",
+      "Cross-feedback: 첫 라운드라 교차 피드백은 없습니다.",
+      "Status: APPROVE"
+    ].join("\n");
+  });
+
+  const orchestrator = new ReviewOrchestrator(storage, compiler, gateway);
+  await orchestrator.run({
+    projectSlug: project.slug,
+    question: "Why Kurly?",
+    draft: "사용자 문제를 해결하는 서비스가 좋아요.",
+    reviewMode: "realtime",
+    coordinatorProvider: "claude",
+    reviewerProviders: ["codex"],
+    rounds: 1,
+    selectedDocumentIds: []
+  });
+
+  const coordinatorIndex = gateway.calls.findIndex((call) => call.participantId === "coordinator");
+  const drafterIndex = gateway.calls.findIndex((call) => call.participantId === "section-drafter");
+  const reviewerIndex = gateway.calls.findIndex((call) => call.participantId === "reviewer-1");
+  assert.ok(coordinatorIndex >= 0);
+  assert.ok(drafterIndex > coordinatorIndex);
+  assert.ok(reviewerIndex > drafterIndex);
+  assert.match(gateway.calls[reviewerIndex]?.prompt ?? "", /드래프터가 다시 쓴 협업 문단입니다\./);
+});
+
 test("realtime prompts explicitly require Korean responses while preserving status lines", async (t) => {
   const workspaceRoot = await createTempWorkspace();
   t.after(async () => cleanupTempWorkspace(workspaceRoot));
@@ -956,10 +1208,11 @@ test("realtime seeds shadow tickets from legacy ledger arrays without changing c
   const project = await storage.createProject("Shinhan Bank");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "finalizer" || /closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "직무 지원 이유를 먼저 닫습니다." : "남은 쟁점을 정리해 마무리합니다.",
         targetSection: "직무 지원 이유",
@@ -1029,10 +1282,11 @@ test("realtime reviewer prompt exposes challenge tickets and requests normalized
   const project = await storage.createProject("Musinsa");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "finalizer" || /closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "지원 동기 문단을 먼저 닫습니다." : "포부 문단을 정리합니다.",
         targetSection: round === 1 ? "지원 동기 문단" : "포부 문단",
@@ -1084,10 +1338,11 @@ test("realtime parses structured section outcome and challenge decisions while k
   const project = await storage.createProject("Shinhan Bank");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "finalizer" || /closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "직무 지원 이유를 먼저 닫습니다." : "포부 문단을 보강합니다.",
         targetSection: round === 1 ? "직무 지원 이유" : "입행 후 포부",
@@ -1155,10 +1410,11 @@ test("realtime downgrades invalid write-final into a blocking-cluster handoff", 
   const project = await storage.createProject("Shinhan Bank");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "finalizer" || /closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       if (round === 1) {
         return buildRealtimeLedgerResponse({
           currentFocus: "직무 지원 이유를 먼저 닫습니다.",
@@ -1220,11 +1476,14 @@ test("realtime downgrades invalid write-final into a blocking-cluster handoff", 
   });
 
   assert.equal(result.artifacts.revisedDraft, "최종본");
-  const roundTwoCoordinatorPrompt = gateway.calls.find(
-    (call) => call.providerId === "claude" && call.round === 2 && !/closing a realtime multi-model essay review session/i.test(call.prompt)
+  const handoffCoordinatorPrompt = gateway.calls.find(
+    (call) =>
+      call.providerId === "claude" &&
+      (call.round ?? 0) >= 2 &&
+      !/closing a realtime multi-model essay review session/i.test(call.prompt) &&
+      /Target Section: 왜 신한인가/.test(call.prompt)
   );
-  assert.ok(roundTwoCoordinatorPrompt);
-  assert.match(roundTwoCoordinatorPrompt.prompt, /Target Section: 왜 신한인가/);
+  assert.ok(handoffCoordinatorPrompt);
   assert.doesNotMatch(
     gateway.calls.find((call) => call.providerId === "claude" && call.round === 1 && /closing a realtime multi-model essay review session/i.test(call.prompt))?.prompt ?? "",
     /./
@@ -1239,10 +1498,11 @@ test("realtime weak-consensus polish runs once per section before finalizing", a
   const project = await storage.createProject("Toss");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (options?.speakerRole === "finalizer" || /closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       if (/most reviewers still recommend advisory revisions/i.test(prompt)) {
         return buildRealtimeLedgerResponse({
           currentFocus: "약한 합의를 한 번 더 정리합니다.",
@@ -1311,10 +1571,11 @@ test("realtime reviewer prompt uses reference packets and excludes self referenc
   const project = await storage.createProject("Shinhan Bank");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "직무 지원 이유를 먼저 닫습니다." : "마지막 포부 문단으로 넘어갑니다.",
         targetSection: round === 1 ? "직무 지원 이유" : "입행 후 포부",
@@ -1384,10 +1645,11 @@ test("realtime reviewer references prioritize Challenge lines over Mini Draft li
   const project = await storage.createProject("Toss");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "지원 이유를 닫습니다." : "포부를 닫습니다.",
         targetSection: round === 1 ? "지원 이유" : "포부",
@@ -1441,10 +1703,11 @@ test("realtime reviewer references normalize structured Challenge grammar before
   const project = await storage.createProject("Shinhan Bank");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종본";
-      }
       return buildRealtimeLedgerResponse({
         currentFocus: round === 1 ? "직무 지원 이유를 닫습니다." : "왜 신한인가 문단으로 넘어갑니다.",
         targetSection: round === 1 ? "직무 지원 이유" : "왜 신한인가",
@@ -1498,10 +1761,11 @@ test("realtime closes a section on REVISE when blockers are cleared and hands of
   const project = await storage.createProject("Kurly");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종 지원서";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      if (/closing a realtime multi-model essay review session/i.test(prompt)) {
-        return "최종 지원서";
-      }
       if (round === 1) {
         return buildRealtimeLedgerResponse({
           currentFocus: "직무 지원 이유를 닫습니다.",
@@ -1573,17 +1837,19 @@ test("realtime BLOCK still prevents section closure even when open challenges ar
   const project = await storage.createProject("Socar");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      return /closing a realtime multi-model essay review session/i.test(prompt)
-        ? "최종본"
-        : buildRealtimeLedgerResponse({
-            currentFocus: "도입 문단을 닫습니다.",
-            targetSection: "도입 문단",
-            miniDraft: "핵심 임팩트를 먼저 말합니다.",
-            acceptedDecisions: ["임팩트를 먼저 둔다"],
-            openChallenges: [],
-            deferredChallenges: []
-          });
+      return buildRealtimeLedgerResponse({
+        currentFocus: "도입 문단을 닫습니다.",
+        targetSection: "도입 문단",
+        miniDraft: "핵심 임팩트를 먼저 말합니다.",
+        acceptedDecisions: ["임팩트를 먼저 둔다"],
+        openChallenges: [],
+        deferredChallenges: []
+      });
     }
 
     return [
@@ -1674,16 +1940,18 @@ test("realtime mode tracks duplicate reviewer slots separately", async (t) => {
   const project = await storage.createProject("Dang근");
   const compiler = new ContextCompiler(storage);
   const gateway = new FakeGateway(healthyStates(), (_providerId, prompt, round, options) => {
+    if (/closing a realtime multi-model essay review session/i.test(prompt)) {
+      return "중복 reviewer 최종본";
+    }
+
     if (options?.speakerRole === "coordinator") {
-      return /closing a realtime multi-model essay review session/i.test(prompt)
-        ? "중복 reviewer 최종본"
-        : buildRealtimeLedgerResponse({
-            currentFocus: "협업 경험을 더 또렷하게 맞춥니다.",
-            targetSection: "협업 문단",
-            miniDraft: "협업 장면을 먼저 보여주고, 그 결과를 숫자로 닫습니다.",
-            acceptedDecisions: ["협업 장면을 구체화한다"],
-            openChallenges: round === 1 ? ["결과 수치가 아직 약하다"] : []
-          });
+      return buildRealtimeLedgerResponse({
+        currentFocus: "협업 경험을 더 또렷하게 맞춥니다.",
+        targetSection: "협업 문단",
+        miniDraft: "협업 장면을 먼저 보여주고, 그 결과를 숫자로 닫습니다.",
+        acceptedDecisions: ["협업 장면을 구체화한다"],
+        openChallenges: round === 1 ? ["결과 수치가 아직 약하다"] : []
+      });
     }
 
     if (round === 1 && options?.participantId === "reviewer-1") {
@@ -1715,16 +1983,17 @@ test("realtime mode tracks duplicate reviewer slots separately", async (t) => {
   assert.equal(result.artifacts.revisedDraft, "중복 reviewer 최종본");
 
   const roundOneReviewerCalls = gateway.calls.filter((call) => call.round === 1 && call.providerId === "codex");
-  assert.equal(roundOneReviewerCalls.length, 2);
+  assert.equal(roundOneReviewerCalls.length, 3);
   assert.deepEqual(
     roundOneReviewerCalls.map((call) => call.participantId),
-    ["reviewer-1", "reviewer-2"]
+    ["reviewer-1", "reviewer-2", "reviewer-3"]
   );
   assert.deepEqual(
     roundOneReviewerCalls.map((call) => call.participantLabel),
-    ["Codex reviewer 1", "Codex reviewer 2"]
+    ["Codex evidence reviewer", "Codex fit reviewer", "Codex voice reviewer"]
   );
   assert.notEqual(roundOneReviewerCalls[0].messageScope, roundOneReviewerCalls[1].messageScope);
+  assert.notEqual(roundOneReviewerCalls[1].messageScope, roundOneReviewerCalls[2].messageScope);
 
   const storedTurnsRaw = await storage.readOptionalRunArtifact(project.slug, result.run.id, "review-turns.json");
   assert.ok(storedTurnsRaw);

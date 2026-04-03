@@ -969,22 +969,71 @@ export const sidebarStyles = String.raw`
         transform: translateX(-50%);
       }
 
-      .reviewer-list {
-        gap: 10px;
-      }
-
-      .reviewer-row {
+      .role-group {
         display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
+        flex-direction: column;
+        gap: 10px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: color-mix(in srgb, var(--panel) 94%, transparent);
       }
 
-      .reviewer-slot-label {
-        font-size: 12px;
-        color: var(--muted);
-        font-weight: 600;
-        flex: 0 0 84px;
+      .role-group-header {
+        align-items: flex-start;
+      }
+
+      .role-row,
+      .role-override-row {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--panel) 92%, transparent);
+      }
+
+      .role-row-header,
+      .role-override-header {
+        align-items: flex-start;
+      }
+
+      .role-summary {
+        justify-content: flex-end;
+      }
+
+      .role-provider-field {
+        align-items: flex-start;
+        width: fit-content;
+        max-width: 100%;
+      }
+
+      .role-provider-select {
+        width: auto;
+        flex: 0 1 auto;
+        field-sizing: content;
+        min-width: 15ch;
+        max-width: min(100%, 24ch);
+        align-self: flex-start;
+      }
+
+      .role-advanced-toggle {
+        white-space: nowrap;
+      }
+
+      .role-advanced-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px;
+        border: 1px dashed color-mix(in srgb, var(--accent) 34%, var(--border));
+        border-radius: 12px;
+        background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+      }
+
+      .role-override-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
       .participant-field {
@@ -1000,43 +1049,6 @@ export const sidebarStyles = String.raw`
         min-width: 11ch;
         max-width: min(100%, 20ch);
         align-self: flex-start;
-      }
-
-      .reviewer-remove-button {
-        width: 32px;
-        height: 32px;
-        padding: 0;
-        border-radius: 999px;
-        border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
-        color: var(--danger);
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        flex: 0 0 auto;
-      }
-
-      .reviewer-remove-button:hover:not(:disabled) {
-        background: color-mix(in srgb, var(--danger) 14%, transparent);
-        border-color: color-mix(in srgb, var(--danger) 70%, var(--border));
-      }
-
-      .reviewer-remove-icon {
-        position: relative;
-        display: inline-block;
-        width: 12px;
-        height: 12px;
-      }
-
-      .reviewer-remove-icon::before {
-        content: "";
-        position: absolute;
-        left: 0;
-        right: 0;
-        top: 50%;
-        height: 2px;
-        border-radius: 999px;
-        background: currentColor;
-        transform: translateY(-50%);
       }
 
       .toggle-pill {

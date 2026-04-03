@@ -139,10 +139,11 @@ export class SidebarStateStore {
 
     const runPreviews = await Promise.all(
       runs.map(async (run) => {
-        const [summary, improvementPlan, revisedDraft, discussionLedger, promptMetrics, notionBrief, chatMessages, events] = await Promise.all([
+        const [summary, improvementPlan, revisedDraft, finalChecks, discussionLedger, promptMetrics, notionBrief, chatMessages, events] = await Promise.all([
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "summary.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "improvement-plan.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "revised-draft.md"),
+          this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "final-checks.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "discussion-ledger.md"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "prompt-metrics.json"),
           this.options.storage!.readOptionalRunArtifact(projectSlug, run.id, "notion-brief.md"),
@@ -152,11 +153,12 @@ export class SidebarStateStore {
 
         return {
           record: run,
-          summaryPreview: (summary || (run.reviewMode === "realtime" ? revisedDraft : undefined))?.slice(0, 400),
+          summaryPreview: (summary || finalChecks || (run.reviewMode === "realtime" ? revisedDraft : undefined))?.slice(0, 400),
           artifacts: {
             summary: Boolean(summary),
             improvementPlan: Boolean(improvementPlan),
             revisedDraft: Boolean(revisedDraft),
+            finalChecks: Boolean(finalChecks),
             discussionLedger: Boolean(discussionLedger),
             promptMetrics: Boolean(promptMetrics),
             notionBrief: Boolean(notionBrief),

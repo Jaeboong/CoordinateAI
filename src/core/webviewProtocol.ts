@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AuthModeSchema, ProviderIdSchema, ReviewModeSchema, RunEventSchema } from "./schemas";
+import { AuthModeSchema, ProviderIdSchema, ReviewModeSchema, RoleAssignmentsSchema, RunEventSchema } from "./schemas";
 import { RunSessionStateSchema, SidebarStateSchema } from "./viewModels";
 
 export const UploadedFileSchema = z.object({
@@ -16,6 +16,7 @@ export const ContinuationPresetSchema = z.object({
   draft: z.string(),
   reviewMode: ReviewModeSchema,
   notionRequest: z.string(),
+  roleAssignments: RoleAssignmentsSchema.optional(),
   coordinatorProvider: ProviderIdSchema,
   reviewerProviders: z.array(ProviderIdSchema),
   selectedDocumentIds: z.array(z.string())
@@ -152,6 +153,7 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     notionRequest: z.string().optional(),
     continuationFromRunId: z.string().optional(),
     continuationNote: z.string().optional(),
+    roleAssignments: RoleAssignmentsSchema.optional(),
     coordinatorProvider: ProviderIdSchema,
     reviewerProviders: z.array(ProviderIdSchema),
     rounds: z.number().int().min(1),

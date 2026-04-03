@@ -25,11 +25,31 @@ export type ReviewMode = (typeof reviewModes)[number];
 export const compileContextProfiles = ["full", "compact", "minimal"] as const;
 export type CompileContextProfile = (typeof compileContextProfiles)[number];
 
+export const essayRoleIds = [
+  "context_researcher",
+  "section_coordinator",
+  "section_drafter",
+  "fit_reviewer",
+  "evidence_reviewer",
+  "voice_reviewer",
+  "finalizer"
+] as const;
+export type EssayRoleId = (typeof essayRoleIds)[number];
+
+export interface RoleAssignment {
+  role: EssayRoleId;
+  providerId: ProviderId;
+  useProviderDefaults: boolean;
+  modelOverride?: string;
+  effortOverride?: string;
+}
+
 export type DocumentScope = "profile" | "project";
 export type ChallengeSeverity = "blocking" | "advisory";
 export type ChallengeStatus = "open" | "deferred" | "closed";
 export type ChallengeSource = "coordinator" | "reviewer" | "user" | "system";
 export type SectionOutcome = "keep-open" | "close-section" | "handoff-next-section" | "write-final";
+export type RunActorRole = "reviewer" | "coordinator" | "researcher" | "drafter" | "finalizer";
 
 export interface ChallengeTicket {
   id: string;
@@ -114,6 +134,7 @@ export interface RunRecord {
   notionBrief?: string;
   continuationFromRunId?: string;
   continuationNote?: string;
+  roleAssignments?: RoleAssignment[];
   coordinatorProvider: ProviderId;
   reviewerProviders: ProviderId[];
   rounds: number;
@@ -127,7 +148,7 @@ export interface ReviewTurn {
   providerId: ProviderId;
   participantId?: string;
   participantLabel?: string;
-  role: "reviewer" | "coordinator";
+  role: RunActorRole;
   round: number;
   prompt: string;
   promptMetrics?: PromptMetrics;
@@ -141,6 +162,15 @@ export interface ReviewTurn {
 export interface DiscussionLedger {
   currentFocus: string;
   miniDraft: string;
+  rewriteDirection?: string;
+  currentObjective?: string;
+  mustKeep?: string[];
+  mustResolve?: string[];
+  availableEvidence?: string[];
+  exitCriteria?: string[];
+  nextOwner?: EssayRoleId;
+  sectionDraft?: string;
+  changeRationale?: string;
   acceptedDecisions: string[];
   openChallenges: string[];
   deferredChallenges: string[];
@@ -212,6 +242,8 @@ export interface PromptExecutionOptions {
   cwd: string;
   authMode: AuthMode;
   apiKey?: string;
+  modelOverride?: string;
+  effortOverride?: string;
   onEvent?: (event: RunEvent) => Promise<void> | void;
   round?: number;
   speakerRole?: ReviewTurn["role"];
@@ -242,6 +274,7 @@ export interface RunArtifacts {
   summary: string;
   improvementPlan: string;
   revisedDraft: string;
+  finalChecks?: string;
 }
 
 export interface RunRequest {
@@ -252,6 +285,7 @@ export interface RunRequest {
   notionRequest?: string;
   continuationFromRunId?: string;
   continuationNote?: string;
+  roleAssignments?: RoleAssignment[];
   coordinatorProvider: ProviderId;
   reviewerProviders: ProviderId[];
   rounds: number;

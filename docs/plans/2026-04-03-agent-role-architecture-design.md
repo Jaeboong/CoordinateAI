@@ -650,6 +650,20 @@ researcher는 Notion 정보를 아래처럼 정리하는 것이 좋다.
 - reviewer를 역할별 output contract로 강화
 - finalizer 도입
 
+## 실사용 시나리오 문서
+
+실제 운영 흐름과 분기 예시는 별도 문서로 분리하는 편이 관리에 더 적합하다.
+
+- 시나리오 문서: `docs/plans/2026-04-03-agent-role-architecture-scenarios.md`
+- 이 문서에는 기본 흐름, blocker 발생 흐름, 사용자 체감 흐름을 따로 정리한다
+
+## UI 설계 문서
+
+역할 구조를 실제 `Runs` 탭 UI에 어떻게 투영할지는 별도 UI 문서로 분리하는 편이 적합하다.
+
+- UI 문서: `docs/plans/2026-04-03-role-based-runs-ui-design.md`
+- 이 문서에는 역할 배치 UI, provider 기본값 상속, 고급 옵션 override, preset 방향을 정리한다
+
 ## 최종 권장안
 
 핵심은 coordinator를 더 똑똑하게 만드는 것이 아니라 더 좁게 만드는 것이다.
