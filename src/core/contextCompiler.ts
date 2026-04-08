@@ -1,5 +1,5 @@
 import { CompileContextProfile, ContextDocument, ProjectRecord } from "./types";
-import { ForJobStorage } from "./storage";
+import { DocumentContentReader } from "./storageInterfaces";
 
 export interface CompileContextRequest {
   project: ProjectRecord;
@@ -18,7 +18,7 @@ export interface CompileContextResult {
 }
 
 export class ContextCompiler {
-  constructor(private readonly storage: ForJobStorage) {}
+  constructor(private readonly storage: DocumentContentReader) {}
 
   async compile(request: CompileContextRequest): Promise<CompileContextResult> {
     const profile = request.profile ?? "full";
@@ -47,6 +47,20 @@ export class ContextCompiler {
       sections.push("");
       sections.push("## Qualifications");
       sections.push(profile === "minimal" ? summarizeText(request.project.qualifications, 320) : request.project.qualifications.trim());
+    }
+    if (request.project.preferredQualifications?.trim()) {
+      sections.push("");
+      sections.push("## Preferred Qualifications");
+      sections.push(
+        profile === "minimal"
+          ? summarizeText(request.project.preferredQualifications, 320)
+          : request.project.preferredQualifications.trim()
+      );
+    }
+    if (request.project.keywords?.length) {
+      sections.push("");
+      sections.push("## Job Keywords");
+      sections.push(request.project.keywords.map((keyword) => `- ${keyword}`).join("\n"));
     }
 
     sections.push("## Evaluation Rubric");

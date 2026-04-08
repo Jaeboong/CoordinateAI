@@ -1,6 +1,7 @@
 import { ContextCompiler } from "./contextCompiler";
 import { resolveRoleAssignments } from "./roleAssignments";
-import { ForJobStorage, RunContinuationContext } from "./storage";
+import { RunContinuationContext } from "./storage";
+import { RunStore } from "./storageInterfaces";
 import {
   ChallengeSeverity,
   ChallengeSource,
@@ -132,7 +133,7 @@ interface ChallengeTicketCluster {
 
 export class ReviewOrchestrator {
   constructor(
-    private readonly storage: ForJobStorage,
+    private readonly storage: RunStore,
     private readonly compiler: ContextCompiler,
     private readonly gateway: OrchestratorGateway
   ) {}
@@ -194,6 +195,7 @@ export class ReviewOrchestrator {
     let run: RunRecord = {
       id: runId,
       projectSlug: request.projectSlug,
+      projectQuestionIndex: request.projectQuestionIndex,
       question: request.question,
       draft: request.draft,
       reviewMode: request.reviewMode,
@@ -659,7 +661,7 @@ export class ReviewOrchestrator {
             timestamp: nowIso(),
             type: "awaiting-user-input",
             round: cycle,
-            message: `Cycle ${cycle} complete. Press Enter to continue, add a note for the next cycle, or type /done to stop.`
+            message: `Cycle ${cycle} complete. Press Enter to continue or add a note for the next cycle. Use the Essay tab's 완료 button to mark the current question done; /done is still available if you need to stop this discussion.`
           });
 
           const intervention = (await requestUserIntervention?.({
@@ -1026,7 +1028,7 @@ export class ReviewOrchestrator {
               timestamp: nowIso(),
               type: "awaiting-user-input",
               round,
-              message: `Round ${round} ended without a document-ready conclusion. Press Enter to continue, add guidance, or type /done to stop without a final draft.`
+              message: `Round ${round} ended without a document-ready conclusion. Press Enter to continue or add guidance. Use the Essay tab's 완료 button for question completion; /done is still available if you need to stop without a final draft.`
             });
 
             if (!requestUserIntervention) {

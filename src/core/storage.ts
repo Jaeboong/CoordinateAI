@@ -3,7 +3,8 @@ import * as path from "node:path";
 import {
   AppPreferences,
   ContextDocument,
-  ContextManifest,
+  ProjectInsightInput,
+  ProjectEssayAnswerState,
   ProjectRecord,
   ProviderId,
   ProviderStatus,
@@ -14,16 +15,17 @@ import {
 } from "./types";
 import {
   AppPreferencesSchema,
-  ContextManifestSchema,
   ProjectRecordSchema,
-  ProviderStatusSchema,
-  RunChatMessageSchema,
-  ReviewTurnSchema,
-  RunRecordSchema
+  ProviderStatusSchema
 } from "./schemas";
-import { ContextExtractor, inferSourceType } from "./contextExtractor";
+import { ContextExtractor } from "./contextExtractor";
 import {
-  createId,
+  essayAnswerDocumentNote,
+  essayAnswerDocumentTitle,
+  reconcileEssayAnswerStates,
+  upsertEssayAnswerState
+} from "./essayQuestionWorkflow";
+import {
   ensureDir,
   fileExists,
   nowIso,
@@ -33,11 +35,11 @@ import {
   slugify,
   writeJsonFile
 } from "./utils";
+import type { DocumentContentReader, ProviderStore, RunStore, StateStoreStorage } from "./storageInterfaces";
+import { ManifestStore } from "./manifestStore";
+import { RunRepository } from "./runRepository";
+import { StoragePaths } from "./storagePaths";
 
-interface DocumentTarget {
-  scope: "profile" | "project";
-  projectSlug?: string;
-}
 
 export interface RunContinuationContext {
   record: RunRecord;
@@ -48,66 +50,78 @@ export interface RunContinuationContext {
   chatMessages?: RunChatMessage[];
 }
 
-export class ForJobStorage {
+export class ForJobStorage implements ProviderStore, DocumentContentReader, StateStoreStorage, RunStore {
+  private readonly paths: StoragePaths;
+  private readonly manifest: ManifestStore;
+  private readonly runs: RunRepository;
+
   constructor(
     private readonly workspaceRoot: string,
-    private readonly storageRootName: string,
+    storageRootName: string,
     private readonly extractor: ContextExtractor = new ContextExtractor()
-  ) {}
+  ) {
+    this.paths = new StoragePaths(workspaceRoot, storageRootName);
+    this.manifest = new ManifestStore(workspaceRoot, this.paths, this.extractor);
+    this.runs = new RunRepository(this.paths);
+  }
 
   get storageRoot(): string {
-    return path.isAbsolute(this.storageRootName) ? this.storageRootName : path.join(this.workspaceRoot, this.storageRootName);
+    return this.paths.storageRoot;
   }
 
   async ensureInitialized(): Promise<void> {
     await Promise.all([
-      ensureDir(this.profileRawDir()),
-      ensureDir(this.profileNormalizedDir()),
-      ensureDir(this.projectsDir()),
-      ensureDir(this.providersDir())
+      ensureDir(this.paths.profileRawDir()),
+      ensureDir(this.paths.profileNormalizedDir()),
+      ensureDir(this.paths.projectsDir()),
+      ensureDir(this.paths.providersDir())
     ]);
 
-    if (!(await fileExists(this.profileManifestPath()))) {
-      await writeJsonFile(this.profileManifestPath(), { documents: [] satisfies ContextDocument[] });
+    if (!(await fileExists(this.paths.profileManifestPath()))) {
+      await writeJsonFile(this.paths.profileManifestPath(), { documents: [] satisfies ContextDocument[] });
     }
 
-    if (!(await fileExists(this.providerStatusesPath()))) {
-      await writeJsonFile(this.providerStatusesPath(), {});
+    if (!(await fileExists(this.paths.providerStatusesPath()))) {
+      await writeJsonFile(this.paths.providerStatusesPath(), {});
     }
 
-    if (!(await fileExists(this.preferencesPath()))) {
-      await writeJsonFile(this.preferencesPath(), {});
+    if (!(await fileExists(this.paths.preferencesPath()))) {
+      await writeJsonFile(this.paths.preferencesPath(), {});
     }
   }
 
   async listProfileDocuments(): Promise<ContextDocument[]> {
-    const manifest = await this.loadManifest(this.profileManifestPath());
+    const manifest = await this.manifest.loadManifest(this.paths.profileManifestPath());
     return manifest.documents.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
   async saveProfileTextDocument(title: string, content: string, pinnedByDefault = false, note?: string): Promise<ContextDocument> {
-    return this.saveTextDocument({ scope: "profile" }, title, content, pinnedByDefault, note);
+    await this.ensureInitialized();
+    return this.manifest.saveTextDocument({ scope: "profile" }, title, content, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async importProfileFile(sourceFilePath: string, pinnedByDefault = false, note?: string): Promise<ContextDocument> {
-    return this.importFileDocument({ scope: "profile" }, sourceFilePath, pinnedByDefault, note);
+    await this.ensureInitialized();
+    return this.manifest.importFileDocument({ scope: "profile" }, sourceFilePath, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async importProfileUpload(fileName: string, bytes: Uint8Array, pinnedByDefault = false, note?: string): Promise<ContextDocument> {
-    return this.importBufferDocument({ scope: "profile" }, fileName, bytes, pinnedByDefault, note);
+    await this.ensureInitialized();
+    return this.manifest.importBufferDocument({ scope: "profile" }, fileName, bytes, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async setProfileDocumentPinned(documentId: string, pinned: boolean): Promise<void> {
-    const manifest = await this.loadManifest(this.profileManifestPath());
-    manifest.documents = manifest.documents.map((document) =>
+    const manifestPath = this.paths.profileManifestPath();
+    const mf = await this.manifest.loadManifest(manifestPath);
+    mf.documents = mf.documents.map((document) =>
       document.id === documentId ? { ...document, pinnedByDefault: pinned } : document
     );
-    await this.saveManifest(this.profileManifestPath(), manifest);
+    await this.manifest.saveManifest(manifestPath, mf);
   }
 
   async listProjects(): Promise<ProjectRecord[]> {
     try {
-      const entries = await fs.readdir(this.projectsDir(), { withFileTypes: true });
+      const entries = await fs.readdir(this.paths.projectsDir(), { withFileTypes: true });
       const projects: ProjectRecord[] = [];
 
       for (const entry of entries) {
@@ -115,7 +129,7 @@ export class ForJobStorage {
           continue;
         }
 
-        const projectPath = path.join(this.projectsDir(), entry.name, "project.json");
+        const projectPath = path.join(this.paths.projectsDir(), entry.name, "project.json");
         if (!(await fileExists(projectPath))) {
           continue;
         }
@@ -135,78 +149,123 @@ export class ForJobStorage {
   }
 
   async getProject(projectSlug: string): Promise<ProjectRecord> {
-    const rawProject = await readJsonFile(this.projectFilePath(projectSlug), {});
+    const rawProject = await readJsonFile(this.paths.projectFilePath(projectSlug), {});
     return ProjectRecordSchema.parse(rawProject);
   }
 
   async createProject(
-    companyName: string,
+    inputOrCompanyName: ProjectInsightInput | string,
     roleName?: string,
     mainResponsibilities?: string,
     qualifications?: string
   ): Promise<ProjectRecord> {
     await this.ensureInitialized();
-    const baseSlug = slugify(companyName);
+    const input = normalizeProjectInsightInput(inputOrCompanyName, roleName, mainResponsibilities, qualifications);
+    const resolvedCompanyName = resolveProjectCompanyName(input);
+    const baseSlug = slugify(resolveProjectSlugSeed(input));
     let slug = baseSlug;
     let counter = 1;
 
-    while (await fileExists(this.projectDir(slug))) {
+    while (await fileExists(this.paths.projectDir(slug))) {
       slug = `${baseSlug}-${counter += 1}`;
     }
 
     const now = nowIso();
     const project: ProjectRecord = {
       slug,
-      companyName,
-      roleName: roleName?.trim() || undefined,
-      mainResponsibilities: mainResponsibilities?.trim() || undefined,
-      qualifications: qualifications?.trim() || undefined,
+      companyName: resolvedCompanyName,
+      roleName: input.roleName?.trim() || undefined,
+      mainResponsibilities: input.mainResponsibilities?.trim() || undefined,
+      qualifications: input.qualifications?.trim() || undefined,
+      preferredQualifications: input.preferredQualifications?.trim() || undefined,
+      keywords: sanitizeKeywords(input.keywords),
+      jobPostingUrl: input.jobPostingUrl?.trim() || undefined,
+      jobPostingText: input.jobPostingText?.trim() || undefined,
+      essayQuestions: sanitizeQuestions(input.essayQuestions),
+      openDartCorpCode: input.openDartCorpCode?.trim() || undefined,
+      jobPostingManualFallback: false,
       rubric: defaultRubric(),
       pinnedDocumentIds: [],
+      insightStatus: "idle",
       createdAt: now,
       updatedAt: now
     };
 
     await Promise.all([
-      ensureDir(this.projectRawDir(slug)),
-      ensureDir(this.projectNormalizedDir(slug)),
-      ensureDir(this.projectRunsDir(slug))
+      ensureDir(this.paths.projectRawDir(slug)),
+      ensureDir(this.paths.projectNormalizedDir(slug)),
+      ensureDir(this.paths.projectRunsDir(slug))
     ]);
-    await writeJsonFile(this.projectContextManifestPath(slug), { documents: [] satisfies ContextDocument[] });
-    await writeJsonFile(this.projectFilePath(slug), project);
+    await writeJsonFile(this.paths.projectContextManifestPath(slug), { documents: [] satisfies ContextDocument[] });
+    await writeJsonFile(this.paths.projectFilePath(slug), project);
     return project;
   }
 
   async updateProject(project: ProjectRecord): Promise<ProjectRecord> {
     const updated = { ...project, updatedAt: nowIso() };
-    await writeJsonFile(this.projectFilePath(project.slug), updated);
+    await writeJsonFile(this.paths.projectFilePath(project.slug), updated);
     return updated;
   }
 
   async updateProjectInfo(
     projectSlug: string,
-    companyName: string,
+    inputOrCompanyName: ProjectInsightInput | string,
     roleName?: string,
     mainResponsibilities?: string,
     qualifications?: string
   ): Promise<ProjectRecord> {
     const project = await this.getProject(projectSlug);
-    const trimmedCompanyName = companyName.trim();
-    if (!trimmedCompanyName) {
-      throw new Error("Project company name cannot be empty.");
+    const input = normalizeProjectInsightInput(inputOrCompanyName, roleName, mainResponsibilities, qualifications);
+    const trimmedCompanyName = resolveProjectCompanyName(input, project.companyName);
+
+    const selectedCandidate = project.openDartCandidates?.find((candidate) => candidate.corpCode === input.openDartCorpCode?.trim());
+    const nextKeywords = sanitizeKeywords(input.keywords);
+    const nextQuestions = sanitizeQuestions(input.essayQuestions);
+    const nextAnswerStates = reconcileEssayAnswerStates(project.essayQuestions, nextQuestions, project.essayAnswerStates);
+    const insightSourceChanged =
+      trimmedCompanyName !== project.companyName ||
+      (input.roleName?.trim() || undefined) !== project.roleName ||
+      (input.mainResponsibilities?.trim() || undefined) !== project.mainResponsibilities ||
+      (input.qualifications?.trim() || undefined) !== project.qualifications ||
+      (input.preferredQualifications?.trim() || undefined) !== project.preferredQualifications ||
+      JSON.stringify(nextKeywords ?? []) !== JSON.stringify(project.keywords ?? []) ||
+      (input.jobPostingUrl?.trim() || undefined) !== project.jobPostingUrl ||
+      (input.jobPostingText?.trim() || undefined) !== project.jobPostingText ||
+      JSON.stringify(nextQuestions ?? []) !== JSON.stringify(project.essayQuestions ?? []) ||
+      (input.openDartCorpCode?.trim() || undefined) !== project.openDartCorpCode;
+
+    for (const documentId of nextAnswerStates.removedDocumentIds) {
+      await this.setProjectDocumentPinned(projectSlug, documentId, false);
     }
 
+    const refreshedProject = nextAnswerStates.removedDocumentIds.length > 0
+      ? await this.getProject(projectSlug)
+      : project;
+
     return this.updateProject({
-      ...project,
+      ...refreshedProject,
       companyName: trimmedCompanyName,
-      roleName: roleName?.trim() || undefined,
-      mainResponsibilities: mainResponsibilities?.trim() || undefined,
-      qualifications: qualifications?.trim() || undefined
+      roleName: input.roleName?.trim() || undefined,
+      mainResponsibilities: input.mainResponsibilities?.trim() || undefined,
+      qualifications: input.qualifications?.trim() || undefined,
+      preferredQualifications: input.preferredQualifications?.trim() || undefined,
+      keywords: nextKeywords,
+      jobPostingUrl: input.jobPostingUrl?.trim() || undefined,
+      jobPostingText: input.jobPostingText?.trim() || undefined,
+      essayQuestions: nextQuestions,
+      openDartCorpCode: input.openDartCorpCode?.trim() || undefined,
+      openDartCorpName: selectedCandidate?.corpName ?? (input.openDartCorpCode ? project.openDartCorpName : undefined),
+      openDartStockCode: selectedCandidate?.stockCode ?? (input.openDartCorpCode ? project.openDartStockCode : undefined),
+      openDartCandidates: input.openDartCorpCode ? project.openDartCandidates : undefined,
+      jobPostingManualFallback: refreshedProject.jobPostingManualFallback,
+      insightStatus: insightSourceChanged && refreshedProject.insightLastGeneratedAt ? "reviewNeeded" : refreshedProject.insightStatus,
+      insightLastError: insightSourceChanged ? undefined : project.insightLastError,
+      essayAnswerStates: nextAnswerStates.states
     });
   }
 
   async deleteProject(projectSlug: string): Promise<void> {
-    await fs.rm(this.projectDir(projectSlug), { recursive: true, force: true });
+    await fs.rm(this.paths.projectDir(projectSlug), { recursive: true, force: true });
   }
 
   async updateProjectRubric(projectSlug: string, rubric: string): Promise<ProjectRecord> {
@@ -215,7 +274,7 @@ export class ForJobStorage {
   }
 
   async listProjectDocuments(projectSlug: string): Promise<ContextDocument[]> {
-    const manifest = await this.loadManifest(this.projectContextManifestPath(projectSlug));
+    const manifest = await this.manifest.loadManifest(this.paths.projectContextManifestPath(projectSlug));
     return manifest.documents.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
@@ -226,11 +285,15 @@ export class ForJobStorage {
     pinnedByDefault = false,
     note?: string
   ): Promise<ContextDocument> {
-    return this.saveTextDocument({ scope: "project", projectSlug }, title, content, pinnedByDefault, note);
+    await this.ensureInitialized();
+    await this.ensureProjectDirs(projectSlug);
+    return this.manifest.saveTextDocument({ scope: "project", projectSlug }, title, content, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async importProjectFile(projectSlug: string, sourceFilePath: string, pinnedByDefault = false, note?: string): Promise<ContextDocument> {
-    return this.importFileDocument({ scope: "project", projectSlug }, sourceFilePath, pinnedByDefault, note);
+    await this.ensureInitialized();
+    await this.ensureProjectDirs(projectSlug);
+    return this.manifest.importFileDocument({ scope: "project", projectSlug }, sourceFilePath, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async importProjectUpload(
@@ -240,16 +303,18 @@ export class ForJobStorage {
     pinnedByDefault = false,
     note?: string
   ): Promise<ContextDocument> {
-    return this.importBufferDocument({ scope: "project", projectSlug }, fileName, bytes, pinnedByDefault, note);
+    await this.ensureInitialized();
+    await this.ensureProjectDirs(projectSlug);
+    return this.manifest.importBufferDocument({ scope: "project", projectSlug }, fileName, bytes, pinnedByDefault, note, (s) => this.getProject(s), (p) => this.updateProject(p));
   }
 
   async setProjectDocumentPinned(projectSlug: string, documentId: string, pinned: boolean): Promise<void> {
-    const manifestPath = this.projectContextManifestPath(projectSlug);
-    const manifest = await this.loadManifest(manifestPath);
+    const manifestPath = this.paths.projectContextManifestPath(projectSlug);
+    const manifest = await this.manifest.loadManifest(manifestPath);
     manifest.documents = manifest.documents.map((document) =>
       document.id === documentId ? { ...document, pinnedByDefault: pinned } : document
     );
-    await this.saveManifest(manifestPath, manifest);
+    await this.manifest.saveManifest(manifestPath, manifest);
 
     const project = await this.getProject(projectSlug);
     const current = new Set(project.pinnedDocumentIds);
@@ -263,7 +328,7 @@ export class ForJobStorage {
   }
 
   async getProfileDocument(documentId: string): Promise<ContextDocument> {
-    const manifest = await this.loadManifest(this.profileManifestPath());
+    const manifest = await this.manifest.loadManifest(this.paths.profileManifestPath());
     const document = manifest.documents.find((item) => item.id === documentId);
     if (!document) {
       throw new Error(`Profile document not found: ${documentId}`);
@@ -273,7 +338,7 @@ export class ForJobStorage {
   }
 
   async getProjectDocument(projectSlug: string, documentId: string): Promise<ContextDocument> {
-    const manifest = await this.loadManifest(this.projectContextManifestPath(projectSlug));
+    const manifest = await this.manifest.loadManifest(this.paths.projectContextManifestPath(projectSlug));
     const document = manifest.documents.find((item) => item.id === documentId);
     if (!document) {
       throw new Error(`Project document not found: ${documentId}`);
@@ -321,8 +386,8 @@ export class ForJobStorage {
       content?: string;
     }
   ): Promise<ContextDocument> {
-    const manifestPath = this.projectContextManifestPath(projectSlug);
-    const manifest = await this.loadManifest(manifestPath);
+    const manifestPath = this.paths.projectContextManifestPath(projectSlug);
+    const manifest = await this.manifest.loadManifest(manifestPath);
     const documentIndex = manifest.documents.findIndex((item) => item.id === documentId);
     if (documentIndex < 0) {
       throw new Error(`Project document not found: ${documentId}`);
@@ -346,14 +411,14 @@ export class ForJobStorage {
 
       const normalizedPath = existing.normalizedPath
         ? this.resolveStoredPath(existing.normalizedPath)
-        : path.join(this.projectNormalizedDir(projectSlug), `${sanitizeFileSegment(`${slugify(updated.title)}-${existing.id}`)}.md`);
+        : path.join(this.paths.projectNormalizedDir(projectSlug), `${sanitizeFileSegment(`${slugify(updated.title)}-${existing.id}`)}.md`);
       await fs.writeFile(normalizedPath, updates.content.trim(), "utf8");
       updated.normalizedPath = relativeFrom(this.workspaceRoot, normalizedPath);
       updated.extractionStatus = "normalized";
     }
 
     manifest.documents[documentIndex] = updated;
-    await this.saveManifest(manifestPath, manifest);
+    await this.manifest.saveManifest(manifestPath, manifest);
 
     const project = await this.getProject(projectSlug);
     const pinned = new Set(project.pinnedDocumentIds);
@@ -367,15 +432,15 @@ export class ForJobStorage {
   }
 
   async deleteProjectDocument(projectSlug: string, documentId: string): Promise<void> {
-    const manifestPath = this.projectContextManifestPath(projectSlug);
-    const manifest = await this.loadManifest(manifestPath);
+    const manifestPath = this.paths.projectContextManifestPath(projectSlug);
+    const manifest = await this.manifest.loadManifest(manifestPath);
     const document = manifest.documents.find((item) => item.id === documentId);
     if (!document) {
       throw new Error(`Project document not found: ${documentId}`);
     }
 
     manifest.documents = manifest.documents.filter((item) => item.id !== documentId);
-    await this.saveManifest(manifestPath, manifest);
+    await this.manifest.saveManifest(manifestPath, manifest);
 
     const rawFilePath = this.resolveStoredPath(document.rawPath);
     await fs.rm(rawFilePath, { force: true });
@@ -390,7 +455,7 @@ export class ForJobStorage {
   }
 
   async loadProviderStatuses(): Promise<Record<ProviderId, ProviderStatus | undefined>> {
-    const raw = await readJsonFile<Record<string, unknown>>(this.providerStatusesPath(), {});
+    const raw = await readJsonFile<Record<string, unknown>>(this.paths.providerStatusesPath(), {});
     const parsed: Record<ProviderId, ProviderStatus | undefined> = {
       codex: undefined,
       claude: undefined,
@@ -408,127 +473,38 @@ export class ForJobStorage {
   }
 
   async saveProviderStatus(status: ProviderStatus): Promise<void> {
-    const current = await readJsonFile<Record<string, ProviderStatus>>(this.providerStatusesPath(), {});
+    const current = await readJsonFile<Record<string, ProviderStatus>>(this.paths.providerStatusesPath(), {});
     current[status.providerId] = status;
-    await writeJsonFile(this.providerStatusesPath(), current);
+    await writeJsonFile(this.paths.providerStatusesPath(), current);
   }
 
   async getPreferences(): Promise<AppPreferences> {
-    const raw = await readJsonFile<Record<string, unknown>>(this.preferencesPath(), {});
+    const raw = await readJsonFile<Record<string, unknown>>(this.paths.preferencesPath(), {});
     return AppPreferencesSchema.parse(raw);
   }
 
   async setLastCoordinatorProvider(providerId: ProviderId): Promise<void> {
     const preferences = await this.getPreferences();
-    await writeJsonFile(this.preferencesPath(), { ...preferences, lastCoordinatorProvider: providerId });
+    await writeJsonFile(this.paths.preferencesPath(), { ...preferences, lastCoordinatorProvider: providerId });
   }
 
   async setLastReviewMode(reviewMode: AppPreferences["lastReviewMode"]): Promise<void> {
     const preferences = await this.getPreferences();
-    await writeJsonFile(this.preferencesPath(), { ...preferences, lastReviewMode: reviewMode });
+    await writeJsonFile(this.paths.preferencesPath(), { ...preferences, lastReviewMode: reviewMode });
   }
 
-  async createRun(record: RunRecord): Promise<string> {
-    const runDir = this.runDir(record.projectSlug, record.id);
-    await ensureDir(runDir);
-    await writeJsonFile(path.join(runDir, "input.json"), record);
-    return runDir;
-  }
-
-  async updateRun(projectSlug: string, runId: string, updates: Partial<RunRecord>): Promise<RunRecord> {
-    const existing = await this.getRun(projectSlug, runId);
-    const merged = RunRecordSchema.parse({ ...existing, ...updates });
-    await writeJsonFile(path.join(this.runDir(projectSlug, runId), "input.json"), merged);
-    return merged;
-  }
-
-  async getRun(projectSlug: string, runId: string): Promise<RunRecord> {
-    const raw = await readJsonFile(path.join(this.runDir(projectSlug, runId), "input.json"), {});
-    return RunRecordSchema.parse(raw);
-  }
-
-  async listRuns(projectSlug: string): Promise<RunRecord[]> {
-    try {
-      const entries = await fs.readdir(this.projectRunsDir(projectSlug), { withFileTypes: true });
-      const runs: RunRecord[] = [];
-      for (const entry of entries) {
-        if (!entry.isDirectory()) {
-          continue;
-        }
-
-        const inputPath = path.join(this.projectRunsDir(projectSlug), entry.name, "input.json");
-        if (!(await fileExists(inputPath))) {
-          continue;
-        }
-
-        const raw = await readJsonFile(inputPath, {});
-        runs.push(RunRecordSchema.parse(raw));
-      }
-
-      return runs.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return [];
-      }
-
-      throw error;
-    }
-  }
-
-  async saveRunTextArtifact(projectSlug: string, runId: string, fileName: string, content: string): Promise<string> {
-    const artifactPath = path.join(this.runDir(projectSlug, runId), fileName);
-    await fs.writeFile(artifactPath, content, "utf8");
-    return artifactPath;
-  }
-
-  async appendRunEvent(projectSlug: string, runId: string, event: RunEvent): Promise<void> {
-    const artifactPath = path.join(this.runDir(projectSlug, runId), "events.ndjson");
-    await fs.appendFile(artifactPath, `${JSON.stringify(event)}\n`, "utf8");
-  }
-
-  async saveReviewTurns(projectSlug: string, runId: string, turns: ReviewTurn[]): Promise<void> {
-    ReviewTurnSchema.array().parse(turns);
-    await writeJsonFile(path.join(this.runDir(projectSlug, runId), "review-turns.json"), turns);
-  }
-
-  async saveRunChatMessages(projectSlug: string, runId: string, messages: RunChatMessage[]): Promise<void> {
-    RunChatMessageSchema.array().parse(messages);
-    await writeJsonFile(path.join(this.runDir(projectSlug, runId), "chat-messages.json"), messages);
-  }
-
-  async readOptionalRunArtifact(projectSlug: string, runId: string, fileName: string): Promise<string | undefined> {
-    const artifactPath = path.join(this.runDir(projectSlug, runId), fileName);
-    if (!(await fileExists(artifactPath))) {
-      return undefined;
-    }
-
-    return fs.readFile(artifactPath, "utf8");
-  }
-
-  async loadRunContinuationContext(projectSlug: string, runId: string): Promise<RunContinuationContext> {
-    const [record, summary, improvementPlan, revisedDraft, notionBrief, chatMessagesRaw] = await Promise.all([
-      this.getRun(projectSlug, runId),
-      this.readOptionalRunArtifact(projectSlug, runId, "summary.md"),
-      this.readOptionalRunArtifact(projectSlug, runId, "improvement-plan.md"),
-      this.readOptionalRunArtifact(projectSlug, runId, "revised-draft.md"),
-      this.readOptionalRunArtifact(projectSlug, runId, "notion-brief.md"),
-      this.readOptionalRunArtifact(projectSlug, runId, "chat-messages.json")
-    ]);
-
-    let chatMessages: RunChatMessage[] | undefined;
-    if (chatMessagesRaw) {
-      chatMessages = RunChatMessageSchema.array().parse(JSON.parse(chatMessagesRaw));
-    }
-
-    return {
-      record,
-      summary,
-      improvementPlan,
-      revisedDraft,
-      notionBrief,
-      chatMessages
-    };
-  }
+  async createRun(record: RunRecord): Promise<string> { return this.runs.createRun(record); }
+  async updateRun(projectSlug: string, runId: string, updates: Partial<RunRecord>): Promise<RunRecord> { return this.runs.updateRun(projectSlug, runId, updates); }
+  async getRun(projectSlug: string, runId: string): Promise<RunRecord> { return this.runs.getRun(projectSlug, runId); }
+  async listRuns(projectSlug: string): Promise<RunRecord[]> { return this.runs.listRuns(projectSlug); }
+  async saveRunTextArtifact(projectSlug: string, runId: string, fileName: string, content: string): Promise<string> { return this.runs.saveRunTextArtifact(projectSlug, runId, fileName, content); }
+  async saveProjectInsightJson(projectSlug: string, fileName: string, data: unknown): Promise<string> { return this.runs.saveProjectInsightJson(projectSlug, fileName, data); }
+  async readProjectInsightJson<T>(projectSlug: string, fileName: string): Promise<T | undefined> { return this.runs.readProjectInsightJson<T>(projectSlug, fileName); }
+  async appendRunEvent(projectSlug: string, runId: string, event: RunEvent): Promise<void> { return this.runs.appendRunEvent(projectSlug, runId, event); }
+  async saveReviewTurns(projectSlug: string, runId: string, turns: ReviewTurn[]): Promise<void> { return this.runs.saveReviewTurns(projectSlug, runId, turns); }
+  async saveRunChatMessages(projectSlug: string, runId: string, messages: RunChatMessage[]): Promise<void> { return this.runs.saveRunChatMessages(projectSlug, runId, messages); }
+  async readOptionalRunArtifact(projectSlug: string, runId: string, fileName: string): Promise<string | undefined> { return this.runs.readOptionalRunArtifact(projectSlug, runId, fileName); }
+  async loadRunContinuationContext(projectSlug: string, runId: string): Promise<RunContinuationContext> { return this.runs.loadRunContinuationContext(projectSlug, runId); }
 
   async readDocumentNormalizedContent(document: ContextDocument): Promise<string | undefined> {
     if (!document.normalizedPath) {
@@ -548,252 +524,81 @@ export class ForJobStorage {
   }
 
   getRunArtifactPath(projectSlug: string, runId: string, fileName: string): string {
-    return path.join(this.runDir(projectSlug, runId), fileName);
+    return this.runs.getRunArtifactPath(projectSlug, runId, fileName);
   }
 
-  private async saveTextDocument(
-    target: DocumentTarget,
+  async saveOrUpdateProjectGeneratedDocument(
+    projectSlug: string,
     title: string,
     content: string,
-    pinnedByDefault: boolean,
-    note?: string
+    note: string,
+    pinnedByDefault = true
   ): Promise<ContextDocument> {
-    await this.ensureInitialized();
-    if (target.scope === "project" && target.projectSlug) {
-      await this.ensureProjectDirs(target.projectSlug);
+    const existing = (await this.listProjectDocuments(projectSlug)).find((document) => document.title === title);
+    if (!existing) {
+      return this.saveProjectTextDocument(projectSlug, title, content, pinnedByDefault, note);
     }
 
-    const id = createId();
-    const fileNameBase = sanitizeFileSegment(`${slugify(title)}-${id}`);
-    const rawDir = this.rawDirForTarget(target);
-    const normalizedDir = this.normalizedDirForTarget(target);
-    const rawFilePath = path.join(rawDir, `${fileNameBase}.txt`);
-    const normalizedFilePath = path.join(normalizedDir, `${fileNameBase}.md`);
-
-    await fs.writeFile(rawFilePath, content, "utf8");
-    await fs.writeFile(normalizedFilePath, content.trim(), "utf8");
-
-    const document: ContextDocument = {
-      id,
-      scope: target.scope,
-      projectSlug: target.projectSlug,
+    return this.updateProjectDocument(projectSlug, existing.id, {
       title,
-      sourceType: "text",
-      rawPath: relativeFrom(this.workspaceRoot, rawFilePath),
-      normalizedPath: relativeFrom(this.workspaceRoot, normalizedFilePath),
+      note,
       pinnedByDefault,
-      extractionStatus: "normalized",
-      note: note?.trim() || undefined,
-      createdAt: nowIso()
-    };
-
-    await this.persistDocument(target, document);
-    return document;
+      content
+    });
   }
 
-  private async importFileDocument(
-    target: DocumentTarget,
-    sourceFilePath: string,
-    pinnedByDefault: boolean,
-    note?: string
-  ): Promise<ContextDocument> {
+  async saveCompletedEssayAnswer(
+    projectSlug: string,
+    questionIndex: number,
+    question: string,
+    answer: string,
+    runId?: string
+  ): Promise<{ document: ContextDocument; project: ProjectRecord; state: ProjectEssayAnswerState }> {
     await this.ensureInitialized();
-    if (target.scope === "project" && target.projectSlug) {
-      await this.ensureProjectDirs(target.projectSlug);
-    }
+    await this.ensureProjectDirs(projectSlug);
 
-    const sourceType = inferSourceType(sourceFilePath);
-    const id = createId();
-    const originalExtension = path.extname(sourceFilePath);
-    const fileNameBase = sanitizeFileSegment(`${path.basename(sourceFilePath, originalExtension)}-${id}`);
-    const rawDir = this.rawDirForTarget(target);
-    const normalizedDir = this.normalizedDirForTarget(target);
-    const rawFilePath = path.join(rawDir, `${fileNameBase}${originalExtension.toLowerCase()}`);
+    const project = await this.getProject(projectSlug);
+    const existingState = project.essayAnswerStates?.find((state) => state.questionIndex === questionIndex);
+    const title = essayAnswerDocumentTitle(questionIndex);
+    const note = essayAnswerDocumentNote(questionIndex, question);
+    const content = answer.trim();
+    const document = existingState?.documentId
+      ? await this.updateProjectDocument(projectSlug, existingState.documentId, {
+        title,
+        note,
+        pinnedByDefault: true,
+        content
+      })
+      : await this.saveProjectTextDocument(projectSlug, title, content, true, note);
 
-    await fs.copyFile(sourceFilePath, rawFilePath);
-
-    let normalizedPath: string | null = null;
-    let extractionStatus: ContextDocument["extractionStatus"] = "rawOnly";
-    try {
-      const extracted = await this.extractor.extract(rawFilePath, sourceType);
-      extractionStatus = extracted.extractionStatus;
-      if (extracted.content) {
-        const normalizedFilePath = path.join(normalizedDir, `${fileNameBase}.md`);
-        await fs.writeFile(normalizedFilePath, extracted.content, "utf8");
-        normalizedPath = relativeFrom(this.workspaceRoot, normalizedFilePath);
-      }
-    } catch (error) {
-      extractionStatus = "failed";
-      note = note ? `${note}\n\nExtraction error: ${(error as Error).message}` : `Extraction error: ${(error as Error).message}`;
-    }
-
-    const document: ContextDocument = {
-      id,
-      scope: target.scope,
-      projectSlug: target.projectSlug,
-      title: path.basename(sourceFilePath),
-      sourceType,
-      rawPath: relativeFrom(this.workspaceRoot, rawFilePath),
-      normalizedPath,
-      pinnedByDefault,
-      extractionStatus,
-      note: note?.trim() || undefined,
-      createdAt: nowIso()
+    const refreshedProject = await this.getProject(projectSlug);
+    const state: ProjectEssayAnswerState = {
+      questionIndex,
+      status: "completed",
+      documentId: document.id,
+      completedAt: nowIso(),
+      lastRunId: runId?.trim() || existingState?.lastRunId
     };
+    const updatedProject = await this.updateProject({
+      ...refreshedProject,
+      essayAnswerStates: upsertEssayAnswerState(refreshedProject.essayAnswerStates, state)
+    });
 
-    await this.persistDocument(target, document);
-    return document;
-  }
-
-  private async importBufferDocument(
-    target: DocumentTarget,
-    fileName: string,
-    bytes: Uint8Array,
-    pinnedByDefault: boolean,
-    note?: string
-  ): Promise<ContextDocument> {
-    await this.ensureInitialized();
-    if (target.scope === "project" && target.projectSlug) {
-      await this.ensureProjectDirs(target.projectSlug);
-    }
-
-    const sourceType = inferSourceType(fileName);
-    const id = createId();
-    const originalExtension = path.extname(fileName);
-    const fileNameBase = sanitizeFileSegment(`${path.basename(fileName, originalExtension)}-${id}`);
-    const rawDir = this.rawDirForTarget(target);
-    const normalizedDir = this.normalizedDirForTarget(target);
-    const rawFilePath = path.join(rawDir, `${fileNameBase}${originalExtension.toLowerCase()}`);
-
-    await fs.writeFile(rawFilePath, Buffer.from(bytes));
-
-    let normalizedPath: string | null = null;
-    let extractionStatus: ContextDocument["extractionStatus"] = "rawOnly";
-    try {
-      const extracted = await this.extractor.extract(rawFilePath, sourceType);
-      extractionStatus = extracted.extractionStatus;
-      if (extracted.content) {
-        const normalizedFilePath = path.join(normalizedDir, `${fileNameBase}.md`);
-        await fs.writeFile(normalizedFilePath, extracted.content, "utf8");
-        normalizedPath = relativeFrom(this.workspaceRoot, normalizedFilePath);
-      }
-    } catch (error) {
-      extractionStatus = "failed";
-      note = note ? `${note}\n\nExtraction error: ${(error as Error).message}` : `Extraction error: ${(error as Error).message}`;
-    }
-
-    const document: ContextDocument = {
-      id,
-      scope: target.scope,
-      projectSlug: target.projectSlug,
-      title: path.basename(fileName),
-      sourceType,
-      rawPath: relativeFrom(this.workspaceRoot, rawFilePath),
-      normalizedPath,
-      pinnedByDefault,
-      extractionStatus,
-      note: note?.trim() || undefined,
-      createdAt: nowIso()
+    return {
+      document,
+      project: updatedProject,
+      state
     };
-
-    await this.persistDocument(target, document);
-    return document;
-  }
-
-  private async persistDocument(target: DocumentTarget, document: ContextDocument): Promise<void> {
-    const manifestPath = target.scope === "profile" ? this.profileManifestPath() : this.projectContextManifestPath(target.projectSlug!);
-    const manifest = await this.loadManifest(manifestPath);
-    manifest.documents.unshift(document);
-    await this.saveManifest(manifestPath, manifest);
-
-    if (target.scope === "project" && target.projectSlug && document.pinnedByDefault) {
-      const project = await this.getProject(target.projectSlug);
-      const pinned = new Set(project.pinnedDocumentIds);
-      pinned.add(document.id);
-      await this.updateProject({ ...project, pinnedDocumentIds: [...pinned] });
-    }
-  }
-
-  private async loadManifest(manifestPath: string): Promise<ContextManifest> {
-    const raw = await readJsonFile(manifestPath, { documents: [] });
-    return ContextManifestSchema.parse(raw);
-  }
-
-  private async saveManifest(manifestPath: string, manifest: ContextManifest): Promise<void> {
-    await writeJsonFile(manifestPath, ContextManifestSchema.parse(manifest));
   }
 
   private async ensureProjectDirs(projectSlug: string): Promise<void> {
-    await Promise.all([ensureDir(this.projectRawDir(projectSlug)), ensureDir(this.projectNormalizedDir(projectSlug)), ensureDir(this.projectRunsDir(projectSlug))]);
+    await Promise.all([ensureDir(this.paths.projectRawDir(projectSlug)), ensureDir(this.paths.projectNormalizedDir(projectSlug)), ensureDir(this.paths.projectRunsDir(projectSlug))]);
 
-    if (!(await fileExists(this.projectContextManifestPath(projectSlug)))) {
-      await writeJsonFile(this.projectContextManifestPath(projectSlug), { documents: [] satisfies ContextDocument[] });
+    if (!(await fileExists(this.paths.projectContextManifestPath(projectSlug)))) {
+      await writeJsonFile(this.paths.projectContextManifestPath(projectSlug), { documents: [] satisfies ContextDocument[] });
     }
   }
 
-  private profileRawDir(): string {
-    return path.join(this.storageRoot, "profile", "raw");
-  }
-
-  private profileNormalizedDir(): string {
-    return path.join(this.storageRoot, "profile", "normalized");
-  }
-
-  private profileManifestPath(): string {
-    return path.join(this.storageRoot, "profile", "manifest.json");
-  }
-
-  private projectsDir(): string {
-    return path.join(this.storageRoot, "projects");
-  }
-
-  private projectDir(projectSlug: string): string {
-    return path.join(this.projectsDir(), projectSlug);
-  }
-
-  private projectRawDir(projectSlug: string): string {
-    return path.join(this.projectDir(projectSlug), "context", "raw");
-  }
-
-  private projectNormalizedDir(projectSlug: string): string {
-    return path.join(this.projectDir(projectSlug), "context", "normalized");
-  }
-
-  private projectContextManifestPath(projectSlug: string): string {
-    return path.join(this.projectDir(projectSlug), "context", "manifest.json");
-  }
-
-  private projectRunsDir(projectSlug: string): string {
-    return path.join(this.projectDir(projectSlug), "runs");
-  }
-
-  private runDir(projectSlug: string, runId: string): string {
-    return path.join(this.projectRunsDir(projectSlug), runId);
-  }
-
-  private projectFilePath(projectSlug: string): string {
-    return path.join(this.projectDir(projectSlug), "project.json");
-  }
-
-  private providersDir(): string {
-    return path.join(this.storageRoot, "providers");
-  }
-
-  private providerStatusesPath(): string {
-    return path.join(this.providersDir(), "status.json");
-  }
-
-  private preferencesPath(): string {
-    return path.join(this.storageRoot, "preferences.json");
-  }
-
-  private rawDirForTarget(target: DocumentTarget): string {
-    return target.scope === "profile" ? this.profileRawDir() : this.projectRawDir(target.projectSlug!);
-  }
-
-  private normalizedDirForTarget(target: DocumentTarget): string {
-    return target.scope === "profile" ? this.profileNormalizedDir() : this.projectNormalizedDir(target.projectSlug!);
-  }
 }
 
 export function defaultRubric(): string {
@@ -805,4 +610,67 @@ export function defaultRubric(): string {
     "- clarity/structure",
     "- tone/authenticity"
   ].join("\n");
+}
+
+function sanitizeKeywords(keywords?: string[]): string[] | undefined {
+  const values = (keywords ?? []).map((keyword) => keyword.trim()).filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function sanitizeQuestions(questions?: string[]): string[] | undefined {
+  const values = (questions ?? []).map((question) => question.trim()).filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function normalizeProjectInsightInput(
+  inputOrCompanyName: ProjectInsightInput | string,
+  roleName?: string,
+  mainResponsibilities?: string,
+  qualifications?: string
+): ProjectInsightInput {
+  if (typeof inputOrCompanyName === "string") {
+    return {
+      companyName: inputOrCompanyName,
+      roleName,
+      mainResponsibilities,
+      qualifications
+    };
+  }
+
+  return inputOrCompanyName;
+}
+
+function resolveProjectCompanyName(input: ProjectInsightInput, existingCompanyName?: string): string {
+  return [
+    input.companyName?.trim(),
+    existingCompanyName?.trim(),
+    inferProjectLabelFromUrl(input.jobPostingUrl),
+    input.roleName?.trim(),
+    "새 프로젝트"
+  ].find(Boolean) || "새 프로젝트";
+}
+
+function resolveProjectSlugSeed(input: ProjectInsightInput): string {
+  return [
+    input.companyName?.trim(),
+    inferProjectLabelFromUrl(input.jobPostingUrl),
+    input.roleName?.trim(),
+    "project"
+  ].find(Boolean) || "project";
+}
+
+function inferProjectLabelFromUrl(jobPostingUrl?: string): string | undefined {
+  const value = jobPostingUrl?.trim();
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const candidate = host.split(".")[0]?.trim();
+    return candidate || undefined;
+  } catch {
+    return undefined;
+  }
 }

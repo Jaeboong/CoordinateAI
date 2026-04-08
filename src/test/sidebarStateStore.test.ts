@@ -45,6 +45,7 @@ test("sidebar state store refreshes only the targeted project slice", async () =
       counters.documents[projectSlug] += 1;
       return [];
     },
+    readDocumentRawContent: async () => undefined,
     listRuns: async (projectSlug: "alpha" | "beta") => {
       counters.runs[projectSlug] += 1;
       return [];
@@ -65,7 +66,8 @@ test("sidebar state store refreshes only the targeted project slice", async () =
   const store = new SidebarStateStore({
     workspaceRoot: "/workspace",
     storage: storage as never,
-    registry
+    registry,
+    extensionVersion: "0.1.0"
   });
 
   await store.initialize();
@@ -82,4 +84,64 @@ test("sidebar state store refreshes only the targeted project slice", async () =
   assert.equal(counters.documents.beta, 1);
   assert.equal(counters.runs.alpha, 2);
   assert.equal(counters.runs.beta, 1);
+  assert.equal(store.snapshot().extensionVersion, "0.1.0");
+});
+
+test("sidebar state store hydrates saved essay answer content into project view models", async () => {
+  const projectRecords: ProjectRecord[] = [
+    {
+      ...createProject("alpha", "Alpha"),
+      essayQuestions: ["지원 동기를 작성해주세요."],
+      essayAnswerStates: [
+        {
+          questionIndex: 0,
+          status: "completed",
+          documentId: "doc-answer",
+          completedAt: "2026-04-08T00:00:00.000Z"
+        }
+      ]
+    }
+  ];
+
+  const storage = {
+    storageRoot: "/workspace/.forjob",
+    ensureInitialized: async () => undefined,
+    listProfileDocuments: async () => [],
+    listProjects: async () => projectRecords,
+    getPreferences: async () => ({}),
+    getProject: async () => projectRecords[0],
+    listProjectDocuments: async () => [
+      {
+        id: "doc-answer",
+        scope: "project" as const,
+        projectSlug: "alpha",
+        title: "essay-answer-q1.md",
+        sourceType: "text" as const,
+        rawPath: ".forjob/projects/alpha/context/raw/doc-answer.txt",
+        normalizedPath: ".forjob/projects/alpha/context/normalized/doc-answer.md",
+        pinnedByDefault: true,
+        extractionStatus: "normalized" as const,
+        createdAt: "2026-04-08T00:00:00.000Z"
+      }
+    ],
+    readDocumentRawContent: async () => "완료된 답안",
+    listRuns: async () => [],
+    readOptionalRunArtifact: async () => undefined
+  };
+
+  const store = new SidebarStateStore({
+    workspaceRoot: "/workspace",
+    storage: storage as never,
+    registry: {
+      listRuntimeStates: async () => [],
+      refreshRuntimeState: async () => {
+        throw new Error("not used");
+      }
+    },
+    extensionVersion: "0.1.0"
+  });
+
+  await store.initialize();
+
+  assert.equal(store.snapshot().projects[0]?.essayAnswerStates[0]?.content, "완료된 답안");
 });

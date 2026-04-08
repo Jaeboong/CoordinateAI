@@ -1,13 +1,16 @@
 import * as path from "node:path";
-import { defaultRubric, ForJobStorage } from "../core/storage";
-import { ProviderId, ProviderRuntimeState } from "../core/types";
+import { defaultRubric } from "../core/storage";
+import { ProviderAuthStatus, ProviderId, ProviderRuntimeState } from "../core/types";
 import { ProjectViewModel, RunSessionState, SidebarState, SidebarStateSchema } from "../core/viewModels";
 import { ProviderRegistry } from "../core/providers";
+import { StateStoreStorage } from "../core/storageInterfaces";
 
 interface StateStoreOptions {
   workspaceRoot?: string;
-  storage?: ForJobStorage;
+  storage?: StateStoreStorage;
   registry?: Pick<ProviderRegistry, "listRuntimeStates" | "refreshRuntimeState">;
+  openDartConfigured?: () => Promise<boolean>;
+  extensionVersion?: string;
 }
 
 export class SidebarStateStore {
@@ -15,6 +18,10 @@ export class SidebarStateStore {
   private profileDocuments = [] as SidebarState["profileDocuments"];
   private projects: ProjectViewModel[] = [];
   private preferences: SidebarState["preferences"] = {};
+  private openDartConfigured = false;
+  private openDartConnectionStatus: ProviderAuthStatus = "untested";
+  private openDartLastCheckAt?: string;
+  private openDartLastError?: string;
   private busyMessage?: string;
   private runState: RunSessionState = { status: "idle" };
 
@@ -28,6 +35,7 @@ export class SidebarStateStore {
     await this.options.storage.ensureInitialized();
     await Promise.all([
       this.refreshProviders(true),
+      this.refreshOpenDartConfigured(),
       this.refreshProfileDocuments(),
       this.refreshProjects(),
       this.refreshPreferences()
@@ -41,6 +49,7 @@ export class SidebarStateStore {
 
     await Promise.all([
       this.refreshProviders(Boolean(options.refreshProviders)),
+      this.refreshOpenDartConfigured(),
       this.refreshProfileDocuments(),
       this.refreshProjects(),
       this.refreshPreferences()
@@ -73,6 +82,10 @@ export class SidebarStateStore {
 
   async refreshPreferences(): Promise<void> {
     this.preferences = this.options.storage ? await this.options.storage.getPreferences() : {};
+  }
+
+  async refreshOpenDartConfigured(): Promise<void> {
+    this.openDartConfigured = this.options.openDartConfigured ? await this.options.openDartConfigured() : false;
   }
 
   async refreshProjects(projectSlug?: string): Promise<void> {
@@ -110,12 +123,27 @@ export class SidebarStateStore {
     this.runState = state;
   }
 
+  setOpenDartConnectionState(state: {
+    status: ProviderAuthStatus;
+    lastCheckAt?: string;
+    lastError?: string;
+  }): void {
+    this.openDartConnectionStatus = state.status;
+    this.openDartLastCheckAt = state.lastCheckAt;
+    this.openDartLastError = state.lastError;
+  }
+
   snapshot(): SidebarState {
     return SidebarStateSchema.parse({
       workspaceOpened: Boolean(this.options.storage && this.options.workspaceRoot),
       storageRoot: this.options.storage && this.options.workspaceRoot
         ? path.relative(this.options.workspaceRoot, this.options.storage.storageRoot) || "."
         : undefined,
+      extensionVersion: this.options.extensionVersion || "0.0.0",
+      openDartConfigured: this.openDartConfigured,
+      openDartConnectionStatus: this.openDartConnectionStatus,
+      openDartLastCheckAt: this.openDartLastCheckAt,
+      openDartLastError: this.openDartLastError,
       providers: this.providers,
       profileDocuments: this.profileDocuments,
       projects: this.projects,
@@ -136,6 +164,16 @@ export class SidebarStateStore {
       this.options.storage.listProjectDocuments(projectSlug),
       this.options.storage.listRuns(projectSlug)
     ]);
+    const essayAnswerStates = await Promise.all(
+      (projectRecord.essayAnswerStates ?? []).map(async (state) => {
+        const document = state.documentId ? documents.find((item) => item.id === state.documentId) : undefined;
+        const content = document ? await this.options.storage!.readDocumentRawContent(document) : undefined;
+        return {
+          ...state,
+          content: content?.trim() ? content : undefined
+        };
+      })
+    );
 
     const runPreviews = await Promise.all(
       runs.map(async (run) => {
@@ -172,6 +210,7 @@ export class SidebarStateStore {
     return {
       record: projectRecord,
       documents,
+      essayAnswerStates,
       runs: runPreviews
     };
   }

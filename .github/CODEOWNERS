@@ -1,0 +1,13 @@
+# Replace @Jaeboong with the owning user or team if your GitHub review group differs.
+
+* @Jaeboong
+
+/agents/** @Jaeboong
+/src/core/orchestrator.ts @Jaeboong
+/src/core/providerStreaming.ts @Jaeboong
+/src/core/notionMcp.ts @Jaeboong
+/src/controller/runSessionManager.ts @Jaeboong
+/scripts/setup-providers.sh @Jaeboong
+/package.json @Jaeboong
+/README.md @Jaeboong
+/.github/** @Jaeboong

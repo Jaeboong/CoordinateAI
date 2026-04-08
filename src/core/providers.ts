@@ -23,7 +23,7 @@ import {
   ProviderStatus,
   RunEvent
 } from "./types";
-import { ForJobStorage } from "./storage";
+import { ProviderStore } from "./storageInterfaces";
 import { nowIso } from "./utils";
 
 const providerNames: Record<ProviderId, string> = {
@@ -40,7 +40,7 @@ export class ProviderRegistry {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly storage: ForJobStorage
+    private readonly storage: ProviderStore
   ) {}
 
   async listRuntimeStates(options: { refresh?: boolean } = {}): Promise<ProviderRuntimeState[]> {

@@ -32,6 +32,7 @@ test("webview message schema accepts review mode on run and continuation payload
   const runMessage = WebviewToExtensionMessageSchema.parse({
     type: "runReview",
     projectSlug: "alpha",
+    projectQuestionIndex: 1,
     question: "question",
     draft: "draft",
     reviewMode: "realtime",
@@ -57,6 +58,7 @@ test("webview message schema accepts review mode on run and continuation payload
 
   assert.equal(runMessage.type, "runReview");
   assert.equal(runMessage.reviewMode, "realtime");
+  assert.equal(runMessage.projectQuestionIndex, 1);
   assert.deepEqual(runMessage.reviewerProviders, ["codex", "codex"]);
   assert.equal(runMessage.roleAssignments?.length, 2);
   assert.equal(runMessage.roleAssignments?.[1]?.modelOverride, "gpt-5.4");
@@ -66,6 +68,7 @@ test("webview message schema accepts review mode on run and continuation payload
     payload: {
       projectSlug: "alpha",
       runId: "run-1",
+      projectQuestionIndex: 1,
       question: "question",
       draft: "draft",
       reviewMode: "deepFeedback",
@@ -85,6 +88,7 @@ test("webview message schema accepts review mode on run and continuation payload
 
   assert.equal(continuationMessage.type, "continuationPreset");
   assert.equal(continuationMessage.payload.reviewMode, "deepFeedback");
+  assert.equal(continuationMessage.payload.projectQuestionIndex, 1);
   assert.equal(continuationMessage.payload.roleAssignments?.[0]?.role, "fit_reviewer");
 
   const continueMessage = WebviewToExtensionMessageSchema.parse({
@@ -96,12 +100,38 @@ test("webview message schema accepts review mode on run and continuation payload
 
   assert.equal(continueMessage.type, "continueRunDiscussion");
   assert.equal(continueMessage.runId, "run-1");
+
+  const clientErrorMessage = WebviewToExtensionMessageSchema.parse({
+    type: "webviewClientError",
+    source: "insightWorkspace",
+    message: "Cannot read properties of undefined",
+    stack: "TypeError: Cannot read properties of undefined",
+    href: "vscode-webview://forjob",
+    phase: "window.error"
+  });
+
+  assert.equal(clientErrorMessage.type, "webviewClientError");
+  assert.equal(clientErrorMessage.source, "insightWorkspace");
+
+  const completeQuestionMessage = WebviewToExtensionMessageSchema.parse({
+    type: "completeEssayQuestion",
+    projectSlug: "alpha",
+    questionIndex: 1,
+    question: "협업 경험을 작성해주세요.",
+    answer: "서비스 장애를 줄이기 위해 협업한 경험입니다.",
+    runId: "run-1"
+  });
+
+  assert.equal(completeQuestionMessage.type, "completeEssayQuestion");
+  assert.equal(completeQuestionMessage.questionIndex, 1);
+  assert.equal(completeQuestionMessage.runId, "run-1");
 });
 
 test("run record schema accepts legacy and role-based run payloads", () => {
   const legacyRecord = RunRecordSchema.parse({
     id: "run-legacy",
     projectSlug: "alpha",
+    projectQuestionIndex: 0,
     question: "question",
     draft: "draft",
     reviewMode: "deepFeedback",
@@ -114,6 +144,7 @@ test("run record schema accepts legacy and role-based run payloads", () => {
   });
 
   assert.equal(legacyRecord.id, "run-legacy");
+  assert.equal(legacyRecord.projectQuestionIndex, 0);
   assert.equal(legacyRecord.roleAssignments, undefined);
 
   const roleBasedRecord = RunRecordSchema.parse({
@@ -233,6 +264,8 @@ test("extension message schema accepts discussion ledger events and artifact fla
     type: "state",
     payload: {
       workspaceOpened: true,
+      extensionVersion: "0.1.0",
+      openDartConfigured: false,
       providers: [],
       profileDocuments: [],
       projects: [
@@ -294,13 +327,23 @@ test("webview message schema accepts structured project fields", () => {
     companyName: "g마켓",
     roleName: "검색 엔진 및 Backend 개발 및 운영",
     mainResponsibilities: "검색 색인(Indexing) 및 데이터 처리 파이프라인 개발",
-    qualifications: "자료구조, 운영체제, 네트워크 등 CS 기초 지식에 대한 이해도 보유"
+    qualifications: "자료구조, 운영체제, 네트워크 등 CS 기초 지식에 대한 이해도 보유",
+    preferredQualifications: "대용량 시스템 운영 경험",
+    keywords: ["Java", "Spring Boot"],
+    jobPostingUrl: "https://example.com/jobs/1",
+    essayQuestions: ["지원 동기를 작성해주세요."],
+    openDartCorpCode: "00126380"
   });
 
   assert.equal(createProjectMessage.type, "createProject");
   assert.equal(createProjectMessage.roleName, "검색 엔진 및 Backend 개발 및 운영");
   assert.equal(createProjectMessage.mainResponsibilities, "검색 색인(Indexing) 및 데이터 처리 파이프라인 개발");
   assert.equal(createProjectMessage.qualifications, "자료구조, 운영체제, 네트워크 등 CS 기초 지식에 대한 이해도 보유");
+  assert.equal(createProjectMessage.preferredQualifications, "대용량 시스템 운영 경험");
+  assert.deepEqual(createProjectMessage.keywords, ["Java", "Spring Boot"]);
+  assert.equal(createProjectMessage.jobPostingUrl, "https://example.com/jobs/1");
+  assert.deepEqual(createProjectMessage.essayQuestions, ["지원 동기를 작성해주세요."]);
+  assert.equal(createProjectMessage.openDartCorpCode, "00126380");
 
   const updateProjectMessage = WebviewToExtensionMessageSchema.parse({
     type: "updateProjectInfo",
@@ -308,13 +351,37 @@ test("webview message schema accepts structured project fields", () => {
     companyName: "g마켓",
     roleName: "검색 엔진 및 Backend 개발 및 운영",
     mainResponsibilities: "검색 품질 향상을 위한 데이터 분석 및 개선 과제 수행",
-    qualifications: "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험"
+    qualifications: "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험",
+    jobPostingText: "주요 업무\n검색 품질 향상을 위한 데이터 분석",
+    essayQuestions: ["협업 경험을 작성해주세요."]
   });
 
   assert.equal(updateProjectMessage.type, "updateProjectInfo");
   assert.equal(updateProjectMessage.projectSlug, "gmarket-search");
   assert.equal(updateProjectMessage.mainResponsibilities, "검색 품질 향상을 위한 데이터 분석 및 개선 과제 수행");
   assert.equal(updateProjectMessage.qualifications, "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험");
+  assert.equal(updateProjectMessage.jobPostingText, "주요 업무\n검색 품질 향상을 위한 데이터 분석");
+  assert.deepEqual(updateProjectMessage.essayQuestions, ["협업 경험을 작성해주세요."]);
+
+  const analyzeMessage = WebviewToExtensionMessageSchema.parse({
+    type: "analyzeProjectInsights",
+    projectSlug: "gmarket-search",
+    companyName: "g마켓",
+    roleName: "백엔드 개발자",
+    jobPostingUrl: "https://example.com/jobs/2"
+  });
+  assert.equal(analyzeMessage.type, "analyzeProjectInsights");
+  assert.equal(analyzeMessage.jobPostingUrl, "https://example.com/jobs/2");
+
+  const generateMessage = WebviewToExtensionMessageSchema.parse({
+    type: "generateProjectInsights",
+    projectSlug: "gmarket-search",
+    companyName: "g마켓",
+    roleName: "백엔드 개발자",
+    essayQuestions: ["지원 동기를 작성해주세요."]
+  });
+  assert.equal(generateMessage.type, "generateProjectInsights");
+  assert.deepEqual(generateMessage.essayQuestions, ["지원 동기를 작성해주세요."]);
 
   const previewRequest = WebviewToExtensionMessageSchema.parse({
     type: "openProfileDocumentPreview",
@@ -346,6 +413,8 @@ test("extension message schema requires typed sidebar state payload", () => {
       type: "state",
       payload: {
         workspaceOpened: true,
+        extensionVersion: "0.1.0",
+        openDartConfigured: false,
         providers: [],
         profileDocuments: [],
         projects: [],

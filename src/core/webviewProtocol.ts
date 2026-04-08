@@ -1,5 +1,12 @@
 import { z } from "zod";
-import { AuthModeSchema, ProviderIdSchema, ReviewModeSchema, RoleAssignmentsSchema, RunEventSchema } from "./schemas";
+import {
+  AuthModeSchema,
+  OpenDartCandidateSchema,
+  ProviderIdSchema,
+  ReviewModeSchema,
+  RoleAssignmentsSchema,
+  RunEventSchema
+} from "./schemas";
 import { RunSessionStateSchema, SidebarStateSchema } from "./viewModels";
 
 export const UploadedFileSchema = z.object({
@@ -12,6 +19,7 @@ export type UploadedFile = z.infer<typeof UploadedFileSchema>;
 export const ContinuationPresetSchema = z.object({
   projectSlug: z.string().min(1),
   runId: z.string().min(1),
+  projectQuestionIndex: z.number().int().min(0).optional(),
   question: z.string(),
   draft: z.string(),
   reviewMode: ReviewModeSchema,
@@ -58,6 +66,20 @@ export const BannerPayloadSchema = z.object({
 
 export type BannerPayload = z.infer<typeof BannerPayloadSchema>;
 
+const ProjectInsightFieldsSchema = z.object({
+  roleName: z.string().optional(),
+  mainResponsibilities: z.string().optional(),
+  qualifications: z.string().optional(),
+  preferredQualifications: z.string().optional(),
+  keywords: z.array(z.string()).optional(),
+  jobPostingUrl: z.string().optional(),
+  jobPostingText: z.string().optional(),
+  essayQuestions: z.array(z.string()).optional(),
+  openDartCorpCode: z.string().optional()
+});
+
+const WebviewClientSourceSchema = z.enum(["sidebar", "insightWorkspace"]);
+
 export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ready") }),
   z.object({ type: z.literal("refresh") }),
@@ -86,7 +108,13 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     companyName: z.string(),
     roleName: z.string().optional(),
     mainResponsibilities: z.string().optional(),
-    qualifications: z.string().optional()
+    qualifications: z.string().optional(),
+    preferredQualifications: z.string().optional(),
+    keywords: z.array(z.string()).optional(),
+    jobPostingUrl: z.string().optional(),
+    jobPostingText: z.string().optional(),
+    essayQuestions: z.array(z.string()).optional(),
+    openDartCorpCode: z.string().optional()
   }),
   z.object({
     type: z.literal("updateProjectInfo"),
@@ -94,8 +122,38 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     companyName: z.string(),
     roleName: z.string().optional(),
     mainResponsibilities: z.string().optional(),
-    qualifications: z.string().optional()
+    qualifications: z.string().optional(),
+    preferredQualifications: z.string().optional(),
+    keywords: z.array(z.string()).optional(),
+    jobPostingUrl: z.string().optional(),
+    jobPostingText: z.string().optional(),
+    essayQuestions: z.array(z.string()).optional(),
+    openDartCorpCode: z.string().optional()
   }),
+  z.object({ type: z.literal("saveOpenDartApiKey"), apiKey: z.string() }),
+  z.object({ type: z.literal("clearOpenDartApiKey") }),
+  z.object({ type: z.literal("testOpenDartConnection") }),
+  z.object({
+    type: z.literal("analyzeProjectInsights"),
+    projectSlug: z.string().min(1),
+    companyName: z.string(),
+    ...ProjectInsightFieldsSchema.shape
+  }),
+  z.object({
+    type: z.literal("generateProjectInsights"),
+    projectSlug: z.string().min(1),
+    companyName: z.string(),
+    ...ProjectInsightFieldsSchema.shape
+  }),
+  z.object({
+    type: z.literal("webviewClientError"),
+    source: WebviewClientSourceSchema,
+    message: z.string().min(1),
+    stack: z.string().optional(),
+    href: z.string().optional(),
+    phase: z.string().optional()
+  }),
+  z.object({ type: z.literal("openInsightWorkspace"), projectSlug: z.string().min(1) }),
   z.object({ type: z.literal("deleteProject"), projectSlug: z.string().min(1) }),
   z.object({
     type: z.literal("saveProjectText"),
@@ -147,6 +205,7 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("runReview"),
     projectSlug: z.string().min(1),
+    projectQuestionIndex: z.number().int().min(0).optional(),
     question: z.string(),
     draft: z.string(),
     reviewMode: ReviewModeSchema,
@@ -159,6 +218,14 @@ export const WebviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     rounds: z.number().int().min(1),
     selectedDocumentIds: z.array(z.string()),
     charLimit: z.number().int().min(1).optional()
+  }),
+  z.object({
+    type: z.literal("completeEssayQuestion"),
+    projectSlug: z.string().min(1),
+    questionIndex: z.number().int().min(0),
+    question: z.string(),
+    answer: z.string(),
+    runId: z.string().optional()
   }),
   z.object({
     type: z.literal("submitRoundIntervention"),
@@ -188,6 +255,13 @@ export type WebviewToExtensionMessage = z.infer<typeof WebviewToExtensionMessage
 
 export const ExtensionToWebviewMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("state"), payload: SidebarStateSchema }),
+  z.object({
+    type: z.literal("openDartCandidates"),
+    payload: z.object({
+      projectSlug: z.string().min(1),
+      candidates: z.array(OpenDartCandidateSchema)
+    })
+  }),
   z.object({ type: z.literal("continuationPreset"), payload: ContinuationPresetSchema }),
   z.object({ type: z.literal("runEvent"), payload: RunEventSchema }),
   z.object({ type: z.literal("banner"), payload: BannerPayloadSchema }),

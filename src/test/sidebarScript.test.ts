@@ -1,6 +1,7 @@
 import * as assert from "node:assert/strict";
 import test from "node:test";
 import { buildSidebarScript } from "../webview/sidebarScript";
+import { buildInsightWorkspaceScript } from "../webview/insightWorkspaceScript";
 
 test("buildSidebarScript returns parseable browser script", () => {
   const script = buildSidebarScript();
@@ -13,8 +14,14 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /심화 피드백/);
   assert.match(script, /AI 도구/);
   assert.match(script, /프로필/);
+  assert.match(script, /OpenDART/);
+  assert.match(script, /버전 v/);
+  assert.match(script, /extensionVersion/);
   assert.match(script, /프로젝트/);
-  assert.match(script, /실행/);
+  assert.match(script, /자기소개서/);
+  assert.match(script, /설정/);
+  assert.match(script, /settingsModalOpen/);
+  assert.match(script, /switch-settings-tab/);
   assert.match(script, /set-review-mode/);
   assert.match(script, /역할 배치/);
   assert.match(script, /고급 옵션/);
@@ -36,6 +43,13 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /toggle-collapsible/);
   assert.match(script, /초기화/);
   assert.match(script, /실행 설정/);
+  assert.match(script, /projectStates/);
+  assert.match(script, /questionStates/);
+  assert.match(script, /activeQuestionIndex/);
+  assert.match(script, /set-active-question/);
+  assert.match(script, /question-nav-list/);
+  assert.match(script, /completeEssayQuestion/);
+  assert.match(script, /완료 업데이트/);
   assert.match(script, /role-group/);
   assert.match(script, /role-advanced-panel/);
   assert.match(script, /collapsibleStates/);
@@ -51,8 +65,33 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /reset-project-rubric/);
   assert.match(script, /회사 이름/);
   assert.match(script, /포지션/);
+  assert.match(script, /지원 공고 URL/);
+  assert.match(script, /에세이 문항/);
+  assert.match(script, /문항 추가/);
+  assert.match(script, /add-essay-question/);
+  assert.match(script, /getAll\("essayQuestions"\)/);
   assert.match(script, /주요 업무/);
   assert.match(script, /자격요건/);
+  assert.match(script, /우대사항/);
+  assert.match(script, /키워드 \/ 기술 스택/);
+  assert.match(script, /공고 원문 붙여넣기/);
+  assert.match(script, /인사이트 프리패스/);
+  assert.match(script, /연결 확인/);
+  assert.match(script, /test-open-dart-connection/);
+  assert.match(script, /공고 분석/);
+  assert.match(script, /인사이트 생성/);
+  assert.match(script, /saveOpenDartApiKey/);
+  assert.match(script, /clearOpenDartApiKey/);
+  assert.match(script, /testOpenDartConnection/);
+  assert.match(script, /analyzeProjectInsights/);
+  assert.match(script, /generateProjectInsights/);
+  assert.match(script, /openInsightWorkspace/);
+  assert.match(script, /readProjectInsightFormPayload/);
+  assert.match(script, /projectInsightStatusMeta/);
+  assert.match(script, /company-insight\.md/);
+  assert.match(script, /job-insight\.md/);
+  assert.match(script, /application-strategy\.md/);
+  assert.match(script, /question-analysis\.md/);
   assert.match(script, /열림/);
   assert.match(script, /접힘/);
   assert.match(script, /삭제/);
@@ -67,6 +106,8 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /toggle-run-extra-doc/);
   assert.match(script, /run-document-chip/);
   assert.match(script, /run-document-toggle-icon/);
+  assert.match(script, /projectQuestionIndex: activeQuestionIndex\(project\)/);
+  assert.doesNotMatch(script, /id="run-question"/);
   assert.match(script, /conversation-composer/);
   assert.match(script, /대화에 메시지를 보내세요/);
   assert.match(script, /논의 이어가기/);
@@ -86,8 +127,43 @@ test("buildSidebarScript returns parseable browser script", () => {
   assert.match(script, /파이널라이저/);
   assert.match(script, /isNotionPrepassMessage/);
   assert.match(script, /context-researcher/);
+  assert.match(script, /if \(appState\?\.(?:runState\?\.)?status === "idle"\) \{\s*liveDiscussionLedger = null;\s*awaitingIntervention = null;/);
+  assert.match(script, /if \(runStatus === "paused" && awaitingIntervention\)/);
   assert.match(script, /최종 점검 열기/);
   assert.match(script, /final-checks\.md/);
   assert.match(script, /completed-run-composer-form/);
   assert.match(script, /continueRunDiscussion/);
+  assert.match(script, /webviewClientError/);
+  assert.match(script, /window\.addEventListener\("error"/);
+});
+
+test("buildInsightWorkspaceScript returns parseable browser script", () => {
+  const script = buildInsightWorkspaceScript({
+    projectSlug: "alpha",
+    companyName: "에코마케팅",
+    roleName: "Java",
+    documents: [
+      {
+        key: "company",
+        tabLabel: "기업 분석",
+        title: "에코마케팅",
+        content: "# 기업 분석",
+        available: true
+      }
+    ]
+  });
+
+  assert.doesNotThrow(() => {
+    const factory = new Function("acquireVsCodeApi", "window", "document", "location", script);
+    factory(
+      () => ({ postMessage() {} }),
+      { addEventListener() {} },
+      { getElementById() { return null; }, addEventListener() {} },
+      { href: "vscode-webview://forjob" }
+    );
+  });
+
+  assert.match(script, /webviewClientError/);
+  assert.match(script, /insightWorkspace/);
+  assert.match(script, /window\.addEventListener\("error"/);
 });

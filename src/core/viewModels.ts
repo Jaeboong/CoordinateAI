@@ -2,7 +2,9 @@ import { z } from "zod";
 import {
   AppPreferencesSchema,
   ContextDocumentSchema,
+  ProjectEssayAnswerStateSchema,
   ProjectRecordSchema,
+  ProviderAuthStatusSchema,
   ProviderRuntimeStateSchema,
   RunRecordSchema
 } from "./schemas";
@@ -27,9 +29,16 @@ export const RunPreviewSchema = z.object({
 
 export type RunPreview = z.infer<typeof RunPreviewSchema>;
 
+export const ProjectEssayAnswerStateViewModelSchema = ProjectEssayAnswerStateSchema.extend({
+  content: z.string().optional()
+});
+
+export type ProjectEssayAnswerStateViewModel = z.infer<typeof ProjectEssayAnswerStateViewModelSchema>;
+
 export const ProjectViewModelSchema = z.object({
   record: ProjectRecordSchema,
   documents: z.array(ContextDocumentSchema),
+  essayAnswerStates: z.array(ProjectEssayAnswerStateViewModelSchema).default([]),
   runs: z.array(RunPreviewSchema)
 });
 
@@ -52,6 +61,11 @@ export type RunSessionState = z.infer<typeof RunSessionStateSchema>;
 export const SidebarStateSchema = z.object({
   workspaceOpened: z.boolean(),
   storageRoot: z.string().optional(),
+  extensionVersion: z.string(),
+  openDartConfigured: z.boolean(),
+  openDartConnectionStatus: ProviderAuthStatusSchema.default("untested"),
+  openDartLastCheckAt: z.string().optional(),
+  openDartLastError: z.string().optional(),
   providers: z.array(ProviderRuntimeStateSchema),
   profileDocuments: z.array(ContextDocumentSchema),
   projects: z.array(ProjectViewModelSchema),

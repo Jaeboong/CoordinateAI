@@ -2,8 +2,10 @@ import { z } from "zod";
 import {
   authModes,
   essayRoleIds,
+  essayQuestionStatuses,
   compileContextProfiles,
   extractionStatuses,
+  insightStatuses,
   providerAuthStatuses,
   providerIds,
   reviewModes,
@@ -40,7 +42,9 @@ export const ExtractionStatusSchema = z.enum(extractionStatuses);
 export const RunStatusSchema = z.enum(runStatuses);
 export const ReviewModeSchema = z.enum(reviewModes);
 export const CompileContextProfileSchema = z.enum(compileContextProfiles);
+export const InsightStatusSchema = z.enum(insightStatuses);
 export const EssayRoleIdSchema = z.enum(essayRoleIds);
+export const EssayQuestionStatusSchema = z.enum(essayQuestionStatuses);
 export const ChallengeSeveritySchema = z.enum(["blocking", "advisory"] as const);
 export const ChallengeStatusSchema = z.enum(["open", "deferred", "closed"] as const);
 export const ChallengeSourceSchema = z.enum(["coordinator", "reviewer", "user", "system"] as const);
@@ -149,12 +153,41 @@ export const ContextManifestSchema = z.object({
   documents: z.array(ContextDocumentSchema)
 });
 
+export const OpenDartCandidateSchema = z.object({
+  corpCode: z.string(),
+  corpName: z.string(),
+  stockCode: z.string().optional()
+});
+
+export const ProjectEssayAnswerStateSchema = z.object({
+  questionIndex: z.number().int().min(0),
+  status: EssayQuestionStatusSchema,
+  documentId: z.string().optional(),
+  completedAt: z.string().optional(),
+  lastRunId: z.string().optional()
+});
+
 export const ProjectRecordSchema = z.object({
   slug: z.string(),
   companyName: z.string(),
   roleName: z.string().optional(),
   mainResponsibilities: z.string().optional(),
   qualifications: z.string().optional(),
+  preferredQualifications: z.string().optional(),
+  keywords: z.array(z.string()).optional(),
+  jobPostingUrl: z.string().optional(),
+  jobPostingText: z.string().optional(),
+  essayQuestions: z.array(z.string()).optional(),
+  openDartCorpCode: z.string().optional(),
+  openDartCorpName: z.string().optional(),
+  openDartStockCode: z.string().optional(),
+  openDartCandidates: z.array(OpenDartCandidateSchema).optional(),
+  postingAnalyzedAt: z.string().optional(),
+  jobPostingManualFallback: z.boolean().optional(),
+  insightStatus: InsightStatusSchema.optional(),
+  insightLastGeneratedAt: z.string().optional(),
+  insightLastError: z.string().optional(),
+  essayAnswerStates: z.array(ProjectEssayAnswerStateSchema).optional(),
   rubric: z.string(),
   pinnedDocumentIds: z.array(z.string()),
   charLimit: z.number().int().min(1).optional(),
@@ -171,6 +204,7 @@ export const AppPreferencesSchema = z.object({
 export const RunRecordSchema = z.object({
   id: z.string(),
   projectSlug: z.string(),
+  projectQuestionIndex: z.number().int().min(0).optional(),
   question: z.string(),
   draft: z.string(),
   reviewMode: ReviewModeSchema.default("deepFeedback"),

@@ -52,6 +52,18 @@ export const sidebarStyles = String.raw`
       }
 
       .tabs {
+        display: block;
+      }
+
+      .tab-strip {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .tab-list,
+      .tabs-actions {
         display: flex;
         align-items: center;
         gap: 8px;
@@ -78,6 +90,10 @@ export const sidebarStyles = String.raw`
         background: var(--chip);
         border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
         font-weight: 600;
+      }
+
+      .settings-tab {
+        border-style: dashed;
       }
 
       .banner {
@@ -276,6 +292,18 @@ export const sidebarStyles = String.raw`
         border-top: 1px solid var(--border);
       }
 
+      .essay-question-fields {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .essay-question-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
       .collapsible-shell {
         gap: 0;
       }
@@ -332,6 +360,44 @@ export const sidebarStyles = String.raw`
         display: flex;
         flex-direction: column;
         gap: 10px;
+      }
+
+      .project-inline-status {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: color-mix(in srgb, var(--panel) 94%, black 4%);
+      }
+
+      .project-inline-status.busy {
+        border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+        background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+      }
+
+      .project-inline-status-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .project-inline-status-message {
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .insight-status-card {
+        gap: 12px;
+      }
+
+      .insight-status-grid {
+        align-items: start;
+      }
+
+      .insight-warning {
+        color: color-mix(in srgb, var(--danger) 82%, var(--vscode-foreground));
       }
 
       .project-fold {
@@ -651,6 +717,33 @@ export const sidebarStyles = String.raw`
 
       .run-setup-body {
         margin-top: 0;
+      }
+
+      .question-nav-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .question-nav-button {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .question-nav-button.selected {
+        border-color: var(--accent);
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent);
+      }
+
+      .question-workspace-card {
+        margin-top: 10px;
+      }
+
+      .question-workspace-text {
+        white-space: pre-wrap;
+        line-height: 1.5;
       }
 
       .collapsible-chevron {
@@ -1163,6 +1256,22 @@ export const sidebarStyles = String.raw`
 
       .modal-close-button {
         white-space: nowrap;
+      }
+
+      .settings-modal {
+        width: min(980px, calc(100vw - 28px));
+      }
+
+      .settings-tabs {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .settings-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
       }
 
       .preview-content {

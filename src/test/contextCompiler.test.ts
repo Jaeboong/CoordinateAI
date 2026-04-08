@@ -9,10 +9,14 @@ test("context compiler includes pinned and selected documents only", async (t) =
 
   const storage = await createStorage(workspaceRoot);
   const project = await storage.createProject(
-    "Shinhan Bank",
-    "Backend",
-    "검색 색인(Indexing) 및 데이터 처리 파이프라인 개발",
-    "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험"
+    {
+      companyName: "Shinhan Bank",
+      roleName: "Backend",
+      mainResponsibilities: "검색 색인(Indexing) 및 데이터 처리 파이프라인 개발",
+      qualifications: "문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험",
+      preferredQualifications: "금융 도메인 또는 대용량 트랜잭션 경험",
+      keywords: ["Java", "Spring Boot", "Kafka"]
+    }
   );
   const compiler = new ContextCompiler(storage);
 
@@ -40,6 +44,11 @@ test("context compiler includes pinned and selected documents only", async (t) =
   assert.match(compiled.markdown, /검색 색인\(Indexing\) 및 데이터 처리 파이프라인 개발/);
   assert.match(compiled.markdown, /## Qualifications/);
   assert.match(compiled.markdown, /문제 해결 과정에서 원인을 논리적으로 분석하고 개선해 본 경험/);
+  assert.match(compiled.markdown, /## Preferred Qualifications/);
+  assert.match(compiled.markdown, /금융 도메인 또는 대용량 트랜잭션 경험/);
+  assert.match(compiled.markdown, /## Job Keywords/);
+  assert.match(compiled.markdown, /Java/);
+  assert.match(compiled.markdown, /Spring Boot/);
   assert.doesNotMatch(compiled.markdown, /Do not include me/);
   assert.ok(compiled.includedDocuments.some((document) => document.id === pinnedProfile.id));
   assert.ok(compiled.includedDocuments.some((document) => document.id === pinnedProject.id));
@@ -90,4 +99,63 @@ test("context compiler applies full, compact, and minimal prompt profiles", asyn
   assert.match(minimal.markdown, /Document bodies omitted in minimal profile/);
   assert.doesNotMatch(minimal.markdown, /COMPACT_TAIL_SHOULD_DISAPPEAR/);
   assert.doesNotMatch(minimal.markdown, /DRAFT_TAIL_SHOULD_DISAPPEAR/);
+});
+
+test("context compiler automatically includes generated insight documents pinned by default", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject("Eco Marketing", "Backend");
+  await storage.saveOrUpdateProjectGeneratedDocument(
+    project.slug,
+    "company-insight.md",
+    "# Company Insight\n공식 공시 기반 요약",
+    "generated",
+    true
+  );
+
+  const compiler = new ContextCompiler(storage);
+  const compiled = await compiler.compile({
+    project: await storage.getProject(project.slug),
+    profileDocuments: await storage.listProfileDocuments(),
+    projectDocuments: await storage.listProjectDocuments(project.slug),
+    selectedDocumentIds: [],
+    question: "지원 동기를 작성해주세요.",
+    draft: ""
+  });
+
+  assert.match(compiled.markdown, /company-insight\.md/);
+  assert.match(compiled.markdown, /공식 공시 기반 요약/);
+});
+
+test("context compiler automatically includes completed essay answers saved as project documents", async (t) => {
+  const workspaceRoot = await createTempWorkspace();
+  t.after(async () => cleanupTempWorkspace(workspaceRoot));
+
+  const storage = await createStorage(workspaceRoot);
+  const project = await storage.createProject({
+    companyName: "Eco Marketing",
+    roleName: "Backend",
+    essayQuestions: ["지원 동기를 작성해주세요."]
+  });
+  await storage.saveCompletedEssayAnswer(
+    project.slug,
+    0,
+    "지원 동기를 작성해주세요.",
+    "완료된 문항 답안입니다."
+  );
+
+  const compiler = new ContextCompiler(storage);
+  const compiled = await compiler.compile({
+    project: await storage.getProject(project.slug),
+    profileDocuments: await storage.listProfileDocuments(),
+    projectDocuments: await storage.listProjectDocuments(project.slug),
+    selectedDocumentIds: [],
+    question: "지원 동기를 작성해주세요.",
+    draft: "작성 중 초안"
+  });
+
+  assert.match(compiled.markdown, /essay-answer-q1\.md/);
+  assert.match(compiled.markdown, /완료된 문항 답안입니다/);
 });

@@ -1,7 +1,9 @@
 dist
+dist-tools
 node_modules
 .vscode-test
 coverage
+.artifacts/
 .forjob/
 .env
 .env.*

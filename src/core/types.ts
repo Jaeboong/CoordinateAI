@@ -24,6 +24,10 @@ export type ReviewMode = (typeof reviewModes)[number];
 
 export const compileContextProfiles = ["full", "compact", "minimal"] as const;
 export type CompileContextProfile = (typeof compileContextProfiles)[number];
+export const insightStatuses = ["idle", "reviewNeeded", "generating", "ready", "error"] as const;
+export type InsightStatus = (typeof insightStatuses)[number];
+export const essayQuestionStatuses = ["idle", "drafting", "completed"] as const;
+export type EssayQuestionStatus = (typeof essayQuestionStatuses)[number];
 
 export const essayRoleIds = [
   "context_researcher",
@@ -105,12 +109,54 @@ export interface ContextManifest {
   documents: ContextDocument[];
 }
 
+export interface OpenDartCandidate {
+  corpCode: string;
+  corpName: string;
+  stockCode?: string;
+}
+
+export interface ProjectInsightInput {
+  companyName: string;
+  roleName?: string;
+  mainResponsibilities?: string;
+  qualifications?: string;
+  preferredQualifications?: string;
+  keywords?: string[];
+  jobPostingUrl?: string;
+  jobPostingText?: string;
+  essayQuestions?: string[];
+  openDartCorpCode?: string;
+}
+
+export interface ProjectEssayAnswerState {
+  questionIndex: number;
+  status: EssayQuestionStatus;
+  documentId?: string;
+  completedAt?: string;
+  lastRunId?: string;
+}
+
 export interface ProjectRecord {
   slug: string;
   companyName: string;
   roleName?: string;
   mainResponsibilities?: string;
   qualifications?: string;
+  preferredQualifications?: string;
+  keywords?: string[];
+  jobPostingUrl?: string;
+  jobPostingText?: string;
+  essayQuestions?: string[];
+  openDartCorpCode?: string;
+  openDartCorpName?: string;
+  openDartStockCode?: string;
+  openDartCandidates?: OpenDartCandidate[];
+  postingAnalyzedAt?: string;
+  jobPostingManualFallback?: boolean;
+  insightStatus?: InsightStatus;
+  insightLastGeneratedAt?: string;
+  insightLastError?: string;
+  essayAnswerStates?: ProjectEssayAnswerState[];
   rubric: string;
   pinnedDocumentIds: string[];
   charLimit?: number;
@@ -127,6 +173,7 @@ export interface AppPreferences {
 export interface RunRecord {
   id: string;
   projectSlug: string;
+  projectQuestionIndex?: number;
   question: string;
   draft: string;
   reviewMode: ReviewMode;
@@ -279,6 +326,7 @@ export interface RunArtifacts {
 
 export interface RunRequest {
   projectSlug: string;
+  projectQuestionIndex?: number;
   question: string;
   draft: string;
   reviewMode: ReviewMode;
@@ -291,4 +339,8 @@ export interface RunRequest {
   rounds: number;
   selectedDocumentIds: string[];
   charLimit?: number;
+}
+
+export interface ProjectEssayAnswerStateViewModel extends ProjectEssayAnswerState {
+  content?: string;
 }
